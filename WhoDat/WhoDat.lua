@@ -16,9 +16,11 @@ WhoDat.peerLookupEnabled = true
 WhoDat.peerRequestCooldownSeconds = 20
 WhoDat.peerRecentRequestMaxAgeSeconds = 60
 WhoDat.peerResponseWaitSeconds = 5
+WhoDat.peerChannelMinLevel = 8
 WhoDat.peerChannelName = "whodatdata"
 WhoDat.peerChannelHints = { "world", "lookingforgroup", "lfg" }
 WhoDat.peerChannelJoinRetrySeconds = 10
+WhoDat.peerLevelGateNoticeCooldownSeconds = 30
 WhoDat.peerPresenceStartupMaxWaitSeconds = 12
 WhoDat.peerPresenceStartupRetrySeconds = 1
 WhoDat.peerSeenMaxAgeSeconds = 600
@@ -31,6 +33,7 @@ WhoDat.lastGuildRosterRefreshAt = 0
 WhoDat.peerRequestSequence = 0
 WhoDat.peerPresencePingSequence = 0
 WhoDat.lastPeerChannelJoinAttemptAt = 0
+WhoDat.lastPeerLevelGateNoticeAt = 0
 WhoDat.lastKnownPeerChannelName = nil
 WhoDat.lastConnectedPeerCount = 0
 WhoDat.pending = {}
@@ -1934,11 +1937,222 @@ end
 
 SendWhoDatAddonMessage = function(message, distribution, target)
     if type(SendAddonMessage) ~= "function" then
+        return false, "unavailable"
+    end
+
+    local ok, resultOrError = pcall(SendAddonMessage, WhoDat.addonCommPrefix, message, distribution, target)
+    if not ok then
+        return false, tostring(resultOrError)
+    end
+
+    if resultOrError == false then
+        return false, "api_returned_false"
+    end
+
+    return true, nil
+end
+
+local function SendWhoDatChannelMessage(message, channelId, channelName)
+    local tried = {}
+    local errors = {}
+
+    local function TryTarget(target, label)
+        if target == nil then
+            return false
+        end
+
+        local key = label .. ":" .. tostring(target)
+        if tried[key] then
+            return false
+        end
+
+        tried[key] = true
+
+        local sent, sendError = SendWhoDatAddonMessage(message, "CHANNEL", target)
+        if sent then
+            return true
+        end
+
+        table.insert(errors, string.format("%s=%s", label, sendError or "unknown"))
         return false
     end
 
-    local sent = pcall(SendAddonMessage, WhoDat.addonCommPrefix, message, distribution, target)
-    return sent
+    if TryTarget(channelId, "id") then
+        return true, nil
+    end
+
+    if type(channelId) == "number" and channelId > 0 then
+        if TryTarget(tostring(channelId), "id_text") then
+            return true, nil
+        end
+    end
+
+    if type(channelName) == "string" and channelName ~= "" then
+        if TryTarget(channelName, "name") then
+            return true, nil
+        end
+    end
+
+    if #errors == 0 then
+        return false, "no_target"
+    end
+
+    return false, table.concat(errors, "; ")
+end
+
+local function IsPeerChannelMessagingAllowed()
+    local minimumLevel = tonumber(WhoDat.peerChannelMinLevel) or 0
+    if minimumLevel <= 0 then
+        return true, nil, minimumLevel
+    end
+
+    if type(UnitLevel) ~= "function" then
+        return true, nil, minimumLevel
+    end
+
+    local playerLevel = UnitLevel("player")
+    if type(playerLevel) == "number" and playerLevel > 0 and playerLevel < minimumLevel then
+        return false, playerLevel, minimumLevel
+    end
+
+    return true, playerLevel, minimumLevel
+end
+
+local function NotifyPeerLevelGate(playerLevel, minimumLevel)
+    local now = GetTime()
+    local lastNoticeAt = WhoDat.lastPeerLevelGateNoticeAt or 0
+    if lastNoticeAt > 0 and now - lastNoticeAt < WhoDat.peerLevelGateNoticeCooldownSeconds then
+        return
+    end
+
+    WhoDat.lastPeerLevelGateNoticeAt = now
+    ChatPrint(string.format(
+        "You need to be level %d to use WhoDat fully. Channel communication is locked below level %d.",
+        minimumLevel,
+        minimumLevel
+    ))
+    AddDebugEvent(string.format(
+        "peer channel blocked by level gate (level=%s, required=%d)",
+        playerLevel and tostring(playerLevel) or "unknown",
+        minimumLevel
+    ))
+end
+
+local function BuildPeerChannelCandidates()
+    EnsurePeerChannelJoined()
+
+    local channels = GetJoinedChannels()
+    if #channels == 0 then
+        return {}
+    end
+
+    local candidates = {}
+    local added = {}
+
+    local function AddChannelCandidate(channel)
+        local channelId = tonumber(channel and channel.id)
+        local channelName = channel and channel.name
+        if not channelId or channelId <= 0 or type(channelName) ~= "string" or channelName == "" then
+            return
+        end
+
+        if added[channelId] then
+            return
+        end
+
+        added[channelId] = true
+        table.insert(candidates, {
+            id = channelId,
+            name = channelName,
+        })
+    end
+
+    local dedicatedChannelId, dedicatedChannelName = GetDedicatedPeerChannel(channels)
+    if dedicatedChannelId then
+        AddChannelCandidate({
+            id = dedicatedChannelId,
+            name = dedicatedChannelName,
+        })
+    end
+
+    for _, hint in ipairs(WhoDat.peerChannelHints or {}) do
+        local normalizedHint = string.lower(hint)
+        for _, channel in ipairs(channels) do
+            if string.find(NormalizeChannelNameForMatch(channel.name), normalizedHint, 1, true) then
+                AddChannelCandidate(channel)
+            end
+        end
+    end
+
+    for _, channel in ipairs(channels) do
+        AddChannelCandidate(channel)
+    end
+
+    return candidates
+end
+
+local function SendWhoDatPeerChannelMessage(message)
+    local allowed, playerLevel, minimumLevel = IsPeerChannelMessagingAllowed()
+    if not allowed then
+        NotifyPeerLevelGate(playerLevel, minimumLevel)
+        return false, nil, nil, "level_gated"
+    end
+
+    local candidates = BuildPeerChannelCandidates()
+    if #candidates == 0 then
+        WhoDat.lastKnownPeerChannelName = nil
+        return false, nil, nil, "no_channel"
+    end
+
+    local errors = {}
+    for _, channel in ipairs(candidates) do
+        local sent, sendError = SendWhoDatChannelMessage(message, channel.id, channel.name)
+        if sent then
+            WhoDat.lastKnownPeerChannelName = channel.name
+            return true, channel.id, channel.name, nil
+        end
+
+        table.insert(errors, string.format("%s=%s", channel.name, sendError or "unknown"))
+    end
+
+    return false, nil, nil, table.concat(errors, "; ")
+end
+
+local function BroadcastWhoDatPeerChannelMessage(message)
+    local allowed, playerLevel, minimumLevel = IsPeerChannelMessagingAllowed()
+    if not allowed then
+        NotifyPeerLevelGate(playerLevel, minimumLevel)
+        return false, 0, nil, "level_gated"
+    end
+
+    local candidates = BuildPeerChannelCandidates()
+    if #candidates == 0 then
+        WhoDat.lastKnownPeerChannelName = nil
+        return false, 0, nil, "no_channel"
+    end
+
+    local successCount = 0
+    local firstChannelName = nil
+    local errors = {}
+
+    for _, channel in ipairs(candidates) do
+        local sent, sendError = SendWhoDatChannelMessage(message, channel.id, channel.name)
+        if sent then
+            successCount = successCount + 1
+            if not firstChannelName then
+                firstChannelName = channel.name
+            end
+            WhoDat.lastKnownPeerChannelName = channel.name
+        else
+            table.insert(errors, string.format("%s=%s", channel.name, sendError or "unknown"))
+        end
+    end
+
+    if successCount > 0 then
+        return true, successCount, firstChannelName, nil
+    end
+
+    return false, 0, nil, table.concat(errors, "; ")
 end
 
 local function BuildPeerRequestId()
@@ -2202,12 +2416,6 @@ local function SendPeerLookupRequest(targetName, pending)
         return false
     end
 
-    local channelId, channelName = GetPreferredPeerChannel()
-    if not channelId then
-        RecordMethodDiagnostic("peer:request", false, "no_channel", targetName)
-        return false
-    end
-
     local requesterName = UnitName("player")
     if not requesterName or requesterName == "" then
         RecordMethodDiagnostic("peer:request", false, "no_requester", targetName)
@@ -2216,10 +2424,26 @@ local function SendPeerLookupRequest(targetName, pending)
 
     local requestId = BuildPeerRequestId()
     local requestMessage = BuildPeerLookupRequestMessage(requesterName, requestId, targetName)
-    local sent = SendWhoDatAddonMessage(requestMessage, "CHANNEL", channelId)
+    local sent, _, channelName, sendError = SendWhoDatPeerChannelMessage(requestMessage)
     if not sent then
-        RecordMethodDiagnostic("peer:request", false, "send_failed", targetName)
-        AddDebugEvent(string.format("peer request send failed for %s on %s", targetName, channelName or "channel"))
+        local failureReason = "send_failed"
+        if sendError == "no_channel" then
+            failureReason = "no_channel"
+        elseif sendError == "level_gated" then
+            failureReason = "level_gated"
+        end
+
+        if pending then
+            pending.peerSendFailureReason = failureReason
+        end
+
+        RecordMethodDiagnostic("peer:request", false, failureReason, targetName)
+        AddDebugEvent(string.format(
+            "peer request send failed for %s on %s (%s)",
+            targetName,
+            channelName or "channel",
+            sendError or "unknown"
+        ))
         return false
     end
 
@@ -2239,16 +2463,12 @@ end
 
 local function SendPeerLookupResponse(requesterName, requestId, targetName, summaryData)
     if not WhoDat.peerLookupEnabled then
-        return false
-    end
-
-    local channelId = select(1, GetPreferredPeerChannel())
-    if not channelId then
-        return false
+        return false, "disabled"
     end
 
     local responseMessage = BuildPeerLookupResponseMessage(requesterName, requestId, targetName, summaryData)
-    return SendWhoDatAddonMessage(responseMessage, "CHANNEL", channelId)
+    local sent, _, _, sendError = BroadcastWhoDatPeerChannelMessage(responseMessage)
+    return sent, sendError
 end
 
 local function StartPeerPresencePing(suppressNoChannelMessage)
@@ -2271,23 +2491,26 @@ local function StartPeerPresencePing(suppressNoChannelMessage)
         return false, "no_requester"
     end
 
-    local channelId, channelName = GetPreferredPeerChannel()
-    if not channelId then
-        WhoDat.lastConnectedPeerCount = 0
-        if not suppressNoChannelMessage then
-            ChatPrint("Connected WhoDat addons: 0 (no shared channel).")
-        end
-        AddDebugEvent("presence ping skipped (no channel)")
-        return false, "no_channel"
-    end
-
     local pingId = BuildPeerPresencePingId()
     local pingMessage = BuildPeerPresencePingMessage(requesterName, pingId)
-    local sent = SendWhoDatAddonMessage(pingMessage, "CHANNEL", channelId)
+    local sent, _, channelName, sendError = SendWhoDatPeerChannelMessage(pingMessage)
     if not sent then
         WhoDat.lastConnectedPeerCount = 0
-        ChatPrint(string.format("Connected WhoDat addons on %s: 0 (ping send failed).", channelName))
-        AddDebugEvent(string.format("presence ping send failed on %s", channelName))
+
+        if sendError == "level_gated" then
+            return false, "level_gated"
+        end
+
+        if sendError == "no_channel" then
+            if not suppressNoChannelMessage then
+                ChatPrint("Connected WhoDat addons: 0 (no shared channel).")
+            end
+            AddDebugEvent("presence ping skipped (no channel)")
+            return false, "no_channel"
+        end
+
+        ChatPrint(string.format("Connected WhoDat addons on %s: 0 (ping send failed: %s).", channelName or "channel", sendError or "unknown"))
+        AddDebugEvent(string.format("presence ping send failed on %s (%s)", channelName or "channel", sendError or "unknown"))
         return false, "send_failed"
     end
 
@@ -2757,6 +2980,13 @@ function WhoDat:OnUpdate(elapsed)
                             "%s is online, but cross-faction details are unavailable on this server: no peer response.",
                             pending.requestName
                         ))
+                    elseif pending.peerSendFailureReason == "level_gated" then
+                        RegisterLookupTimeout(pending, "wrong_faction_level_gated")
+                        ChatPrint(string.format(
+                            "%s is online, but cross-faction details require level %d+ for addon channel communication.",
+                            pending.requestName,
+                            WhoDat.peerChannelMinLevel
+                        ))
                     else
                         RegisterLookupTimeout(pending, "wrong_faction_no_peer_channel")
                         ChatPrint(string.format(
@@ -2794,6 +3024,9 @@ function WhoDat:OnUpdate(elapsed)
                     if pending.peerRequestedAt then
 
                         table.insert(detailParts, "no peer response")
+                    elseif pending.peerSendFailureReason == "level_gated" then
+
+                        table.insert(detailParts, string.format("peer channel locked below level %d", WhoDat.peerChannelMinLevel))
                     end
 
                     local detailNote = ""
@@ -2948,10 +3181,22 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
         local pingRequesterName, pingId = ParsePeerPresencePingMessage(message)
         if pingRequesterName then
             if NormalizeName(pingRequesterName) ~= NormalizeName(ownName) then
-                local channelId = select(1, GetPreferredPeerChannel())
-                if channelId then
-                    local ackMessage = BuildPeerPresenceAckMessage(pingRequesterName, pingId)
-                    SendWhoDatAddonMessage(ackMessage, "CHANNEL", channelId)
+                local ackMessage = BuildPeerPresenceAckMessage(pingRequesterName, pingId)
+                local sent, successCount, firstChannelName, sendError = BroadcastWhoDatPeerChannelMessage(ackMessage)
+                if not sent then
+                    AddDebugEvent(string.format(
+                        "presence ack send failed to %s on %s (%s)",
+                        pingRequesterName,
+                        firstChannelName or "channel",
+                        sendError or "unknown"
+                    ))
+                elseif successCount > 1 then
+                    AddDebugEvent(string.format(
+                        "presence ack sent to %s on %d channels (first=%s)",
+                        pingRequesterName,
+                        successCount,
+                        firstChannelName or "channel"
+                    ))
                 end
             end
             return
@@ -2981,7 +3226,7 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
 
             local summaryData = BuildPeerLookupSummaryByName(targetName)
             if summaryData then
-                local sent = SendPeerLookupResponse(requesterName, requestId, targetName, summaryData)
+                local sent, sendError = SendPeerLookupResponse(requesterName, requestId, targetName, summaryData)
                 if sent then
                     IncrementSummaryCounter("peerAssistSent", 1)
                     RecordMethodDiagnostic("peer:assist-out", true, "sent", targetName)
@@ -2993,8 +3238,14 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
                     ))
                     DebugPrint(string.format("answered peer lookup for %s", targetName))
                 else
-                    RecordMethodDiagnostic("peer:assist-out", false, "send_failed", targetName)
-                    AddDebugEvent(string.format("peer assist send failed for %s to %s", targetName, requesterName))
+                    local assistFailureReason = sendError == "level_gated" and "level_gated" or "send_failed"
+                    RecordMethodDiagnostic("peer:assist-out", false, assistFailureReason, targetName)
+                    AddDebugEvent(string.format(
+                        "peer assist send failed for %s to %s (%s)",
+                        targetName,
+                        requesterName,
+                        sendError or "unknown"
+                    ))
                 end
             end
             return
@@ -3133,6 +3384,24 @@ function WhoDat:HandlePlayerLogin()
     WhoDatDB.channelCache = WhoDatDB.channelCache or {}
     self.channelCache = WhoDatDB.channelCache
     ResetDebugTracking()
+
+    do
+        local registerPrefix = nil
+        if type(C_ChatInfo) == "table" and type(C_ChatInfo.RegisterAddonMessagePrefix) == "function" then
+            registerPrefix = C_ChatInfo.RegisterAddonMessagePrefix
+        elseif type(RegisterAddonMessagePrefix) == "function" then
+            registerPrefix = RegisterAddonMessagePrefix
+        end
+
+        if registerPrefix then
+            local ok, registered = pcall(registerPrefix, self.addonCommPrefix)
+            if ok and registered ~= false then
+                AddDebugEvent(string.format("addon prefix registered: %s", self.addonCommPrefix))
+            else
+                AddDebugEvent(string.format("addon prefix register failed: %s", self.addonCommPrefix))
+            end
+        end
+    end
 
     if ChatFrameAddMessageEventFilter then
         ChatFrameAddMessageEventFilter("CHAT_MSG_SYSTEM", SystemMessageFilter)
