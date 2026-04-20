@@ -16,7 +16,9 @@ WhoDat.peerLookupEnabled = true
 WhoDat.peerRequestCooldownSeconds = 20
 WhoDat.peerRecentRequestMaxAgeSeconds = 60
 WhoDat.peerResponseWaitSeconds = 5
+WhoDat.peerChannelName = "whodatdata"
 WhoDat.peerChannelHints = { "world", "lookingforgroup", "lfg" }
+WhoDat.peerChannelJoinRetrySeconds = 10
 WhoDat.peerSeenMaxAgeSeconds = 600
 WhoDat.peerPresencePingWaitSeconds = 3
 WhoDat.guildRosterRefreshIntervalSeconds = 10
@@ -26,6 +28,7 @@ WhoDat.lastChannelScanAt = 0
 WhoDat.lastGuildRosterRefreshAt = 0
 WhoDat.peerRequestSequence = 0
 WhoDat.peerPresencePingSequence = 0
+WhoDat.lastPeerChannelJoinAttemptAt = 0
 WhoDat.lastKnownPeerChannelName = nil
 WhoDat.lastConnectedPeerCount = 0
 WhoDat.pending = {}
@@ -1831,10 +1834,82 @@ local function GetJoinedChannels()
     return channels
 end
 
+local function GetDedicatedPeerChannel(channels)
+    local configuredName = NormalizeChannelNameForMatch(WhoDat.peerChannelName)
+    if configuredName == "" then
+        return nil, nil
+    end
+
+    channels = channels or GetJoinedChannels()
+    for _, channel in ipairs(channels) do
+        if NormalizeChannelNameForMatch(channel.name) == configuredName then
+            return channel.id, channel.name
+        end
+    end
+
+    return nil, nil
+end
+
+local function EnsurePeerChannelJoined()
+    local channels = GetJoinedChannels()
+    local channelId, channelName = GetDedicatedPeerChannel(channels)
+    if channelId then
+        WhoDat.lastKnownPeerChannelName = channelName
+        return true, channelId, channelName
+    end
+
+    local configuredName = WhoDat.peerChannelName
+    if type(configuredName) ~= "string" or configuredName == "" then
+        return false, nil, nil
+    end
+
+    if type(JoinChannelByName) ~= "function" then
+        AddDebugEvent("peer channel auto-join unavailable")
+        return false, nil, nil
+    end
+
+    local now = GetTime()
+    local lastAttemptAt = WhoDat.lastPeerChannelJoinAttemptAt or 0
+    if lastAttemptAt > 0 and now - lastAttemptAt < WhoDat.peerChannelJoinRetrySeconds then
+        return false, nil, nil
+    end
+
+    WhoDat.lastPeerChannelJoinAttemptAt = now
+    local joined = pcall(JoinChannelByName, configuredName)
+    if joined then
+        AddDebugEvent(string.format("peer channel join requested: %s", configuredName))
+    else
+        AddDebugEvent(string.format("peer channel join failed: %s", configuredName))
+    end
+
+    channels = GetJoinedChannels()
+    channelId, channelName = GetDedicatedPeerChannel(channels)
+    if channelId then
+        WhoDat.lastKnownPeerChannelName = channelName
+        return true, channelId, channelName
+    end
+
+    return joined, nil, configuredName
+end
+
 local function GetPreferredPeerChannel()
     local channels = GetJoinedChannels()
+
+    local dedicatedChannelId, dedicatedChannelName = GetDedicatedPeerChannel(channels)
+    if dedicatedChannelId then
+        WhoDat.lastKnownPeerChannelName = dedicatedChannelName
+        return dedicatedChannelId, dedicatedChannelName
+    end
+
+    local joinTriggered, joinedChannelId, joinedChannelName = EnsurePeerChannelJoined()
+    if joinedChannelId then
+        WhoDat.lastKnownPeerChannelName = joinedChannelName
+        return joinedChannelId, joinedChannelName
+    end
+
+    channels = GetJoinedChannels()
     if #channels == 0 then
-        WhoDat.lastKnownPeerChannelName = nil
+        WhoDat.lastKnownPeerChannelName = joinTriggered and joinedChannelName or nil
         return nil, nil
     end
 
@@ -3030,6 +3105,7 @@ function WhoDat:HandlePlayerLogin()
         WhoDat:HandleSlashCommand(message)
     end
 
+    EnsurePeerChannelJoined()
     StartPeerPresencePing()
     SetLookupTicker(true)
 
