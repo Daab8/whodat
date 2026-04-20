@@ -19,6 +19,8 @@ WhoDat.peerResponseWaitSeconds = 5
 WhoDat.peerChannelName = "whodatdata"
 WhoDat.peerChannelHints = { "world", "lookingforgroup", "lfg" }
 WhoDat.peerChannelJoinRetrySeconds = 10
+WhoDat.peerPresenceStartupMaxWaitSeconds = 12
+WhoDat.peerPresenceStartupRetrySeconds = 1
 WhoDat.peerSeenMaxAgeSeconds = 600
 WhoDat.peerPresencePingWaitSeconds = 3
 WhoDat.guildRosterRefreshIntervalSeconds = 10
@@ -39,6 +41,7 @@ WhoDat.lastPeerLookupAt = {}
 WhoDat.peerRecentRequests = {}
 WhoDat.peerSeen = {}
 WhoDat.peerPresencePending = nil
+WhoDat.peerPresenceStartup = nil
 WhoDat.methodStats = {}
 WhoDat.methodStatsStartedAt = 0
 WhoDat.debugEvents = {}
@@ -327,6 +330,7 @@ local function ResetDebugTracking()
     WhoDat.lookupSequence = 0
     WhoDat.peerSeen = {}
     WhoDat.peerPresencePending = nil
+    WhoDat.peerPresenceStartup = nil
     WhoDat.lastConnectedPeerCount = 0
 end
 
@@ -2247,32 +2251,34 @@ local function SendPeerLookupResponse(requesterName, requestId, targetName, summ
     return SendWhoDatAddonMessage(responseMessage, "CHANNEL", channelId)
 end
 
-local function StartPeerPresencePing()
+local function StartPeerPresencePing(suppressNoChannelMessage)
     if not WhoDat.peerLookupEnabled then
         WhoDat.lastConnectedPeerCount = 0
         ChatPrint("Connected WhoDat addons: peer mode disabled.")
         AddDebugEvent("presence ping skipped (peer mode disabled)")
-        return
+        return false, "disabled"
     end
 
     if type(SendAddonMessage) ~= "function" then
         WhoDat.lastConnectedPeerCount = 0
         ChatPrint("Connected WhoDat addons: addon communication API unavailable.")
         AddDebugEvent("presence ping skipped (addon comm unavailable)")
-        return
+        return false, "unavailable"
     end
 
     local requesterName = UnitName("player")
     if not requesterName or requesterName == "" then
-        return
+        return false, "no_requester"
     end
 
     local channelId, channelName = GetPreferredPeerChannel()
     if not channelId then
         WhoDat.lastConnectedPeerCount = 0
-        ChatPrint("Connected WhoDat addons: 0 (no shared channel).")
+        if not suppressNoChannelMessage then
+            ChatPrint("Connected WhoDat addons: 0 (no shared channel).")
+        end
         AddDebugEvent("presence ping skipped (no channel)")
-        return
+        return false, "no_channel"
     end
 
     local pingId = BuildPeerPresencePingId()
@@ -2282,7 +2288,7 @@ local function StartPeerPresencePing()
         WhoDat.lastConnectedPeerCount = 0
         ChatPrint(string.format("Connected WhoDat addons on %s: 0 (ping send failed).", channelName))
         AddDebugEvent(string.format("presence ping send failed on %s", channelName))
-        return
+        return false, "send_failed"
     end
 
     WhoDat.peerPresencePending = {
@@ -2293,9 +2299,54 @@ local function StartPeerPresencePing()
     }
 
     AddDebugEvent(string.format("presence ping sent on %s", channelName))
+    return true, "sent"
+end
+
+local function BeginPeerPresenceStartupCheck()
+    WhoDat.peerPresenceStartup = {
+        startedAt = GetTime(),
+        nextAttemptAt = 0,
+    }
+end
+
+local function AdvancePeerPresenceStartupCheck(now)
+    local startup = WhoDat.peerPresenceStartup
+    if not startup or WhoDat.peerPresencePending then
+        return
+    end
+
+    if now < (startup.nextAttemptAt or 0) then
+        return
+    end
+
+    EnsurePeerChannelJoined()
+    local sent, reason = StartPeerPresencePing(true)
+    if sent then
+        WhoDat.peerPresenceStartup = nil
+        return
+    end
+
+    if reason ~= "no_channel" then
+        WhoDat.peerPresenceStartup = nil
+        return
+    end
+
+    if now - (startup.startedAt or now) >= WhoDat.peerPresenceStartupMaxWaitSeconds then
+        WhoDat.lastConnectedPeerCount = 0
+        ChatPrint(string.format("Connected WhoDat addons: 0 (no shared channel: %s).", WhoDat.peerChannelName or "channel"))
+        AddDebugEvent(string.format("presence ping startup timeout waiting for %s", WhoDat.peerChannelName or "channel"))
+        WhoDat.peerPresenceStartup = nil
+        return
+    end
+
+    startup.nextAttemptAt = now + WhoDat.peerPresenceStartupRetrySeconds
 end
 
 local function HasPendingLookups()
+    if WhoDat.peerPresenceStartup then
+        return true
+    end
+
     if WhoDat.peerPresencePending then
         return true
     end
@@ -2669,6 +2720,8 @@ function WhoDat:OnUpdate(elapsed)
     PrunePeerRecentRequests()
 
     local now = GetTime()
+    AdvancePeerPresenceStartupCheck(now)
+
     if self.peerPresencePending and now - self.peerPresencePending.startedAt >= self.peerPresencePingWaitSeconds then
         local connectedCount = GetTableCount(self.peerPresencePending.responders)
         self.lastConnectedPeerCount = connectedCount
@@ -3106,7 +3159,7 @@ function WhoDat:HandlePlayerLogin()
     end
 
     EnsurePeerChannelJoined()
-    StartPeerPresencePing()
+    BeginPeerPresenceStartupCheck()
     SetLookupTicker(true)
 
     ChatPrint("Loaded. Shift-click a player name or use /whodat Name to query level/class/location.")
