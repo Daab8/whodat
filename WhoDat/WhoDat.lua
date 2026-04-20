@@ -12,23 +12,35 @@ WhoDat.channelNilBreakThreshold = 15
 WhoDat.chatPresenceMaxAgeSeconds = 300
 WhoDat.addonCommPrefix = "WHODATX1"
 WhoDat.addonLookupCooldownSeconds = 20
-WhoDat.peerLookupEnabled = false
+WhoDat.peerLookupEnabled = true
 WhoDat.peerRequestCooldownSeconds = 20
 WhoDat.peerRecentRequestMaxAgeSeconds = 60
 WhoDat.peerResponseWaitSeconds = 5
 WhoDat.peerChannelHints = { "world", "lookingforgroup", "lfg" }
+WhoDat.peerSeenMaxAgeSeconds = 600
+WhoDat.peerPresencePingWaitSeconds = 3
 WhoDat.guildRosterRefreshIntervalSeconds = 10
 WhoDat.debugEnabled = false
+WhoDat.debugLogMaxEvents = 50
 WhoDat.lastChannelScanAt = 0
 WhoDat.lastGuildRosterRefreshAt = 0
 WhoDat.peerRequestSequence = 0
+WhoDat.peerPresencePingSequence = 0
 WhoDat.lastKnownPeerChannelName = nil
+WhoDat.lastConnectedPeerCount = 0
 WhoDat.pending = {}
 WhoDat.channelCache = {}
 WhoDat.recentChatPresence = {}
 WhoDat.lastAddonLookupAt = {}
 WhoDat.lastPeerLookupAt = {}
 WhoDat.peerRecentRequests = {}
+WhoDat.peerSeen = {}
+WhoDat.peerPresencePending = nil
+WhoDat.methodStats = {}
+WhoDat.methodStatsStartedAt = 0
+WhoDat.debugEvents = {}
+WhoDat.debugSummary = {}
+WhoDat.lookupSequence = 0
 WhoDat.scanInterval = 0.2
 WhoDat.scanElapsed = 0
 WhoDat.suppressedFriendSystemMessages = {
@@ -141,6 +153,359 @@ local function NormalizeName(name)
     end
 
     return string.lower(name)
+end
+
+local METHOD_LOG_ORDER = {
+    "lookup:start",
+    "lookup:complete",
+    "lookup:timeout",
+    "friends:GetFriendInfo",
+    "channel:GetChannelMemberInfo",
+    "channel:GetChannelRosterInfo",
+    "guid:GetPlayerInfoByGUID",
+    "addon:whisperRequest",
+    "addon:whisperResponse",
+    "peer:request",
+    "peer:response",
+    "peer:assist-out",
+    "peer:assist-in",
+}
+
+local METHOD_LOG_KNOWN = {}
+for _, methodName in ipairs(METHOD_LOG_ORDER) do
+    METHOD_LOG_KNOWN[methodName] = true
+end
+
+local function CountEntries(tableValue)
+    if type(tableValue) ~= "table" then
+        return 0
+    end
+
+    local count = 0
+    for _ in pairs(tableValue) do
+        count = count + 1
+    end
+
+    return count
+end
+
+local function EnsureMethodStat(methodName)
+    if type(methodName) ~= "string" or methodName == "" then
+        return nil
+    end
+
+    local stat = WhoDat.methodStats[methodName]
+    if stat then
+        return stat
+    end
+
+    stat = {
+        attempts = 0,
+        success = 0,
+        fail = 0,
+        unavailable = 0,
+        players = {},
+        uniquePlayers = 0,
+        reasons = {},
+    }
+
+    WhoDat.methodStats[methodName] = stat
+    return stat
+end
+
+local function RecordMethodDiagnostic(methodName, success, reason, playerName)
+    local stat = EnsureMethodStat(methodName)
+    if not stat then
+        return
+    end
+
+    stat.attempts = stat.attempts + 1
+    if success then
+        stat.success = stat.success + 1
+    else
+        stat.fail = stat.fail + 1
+    end
+
+    if reason == "unavailable" then
+        stat.unavailable = stat.unavailable + 1
+    end
+
+    if type(reason) == "string" and reason ~= "" then
+        stat.reasons[reason] = (stat.reasons[reason] or 0) + 1
+    end
+
+    local normalizedPlayerName = NormalizeName(playerName)
+    if normalizedPlayerName and not stat.players[normalizedPlayerName] then
+        stat.players[normalizedPlayerName] = true
+        stat.uniquePlayers = stat.uniquePlayers + 1
+    end
+end
+
+local function AddDebugEvent(message)
+    if type(message) ~= "string" or message == "" then
+        return
+    end
+
+    local entry = string.format("[%s] %s", date("%H:%M:%S"), message)
+    table.insert(WhoDat.debugEvents, entry)
+
+    while #WhoDat.debugEvents > WhoDat.debugLogMaxEvents do
+        table.remove(WhoDat.debugEvents, 1)
+    end
+end
+
+local function IncrementSummaryCounter(counterKey, amount)
+    if type(counterKey) ~= "string" or counterKey == "" then
+        return
+    end
+
+    if type(WhoDat.debugSummary[counterKey]) ~= "number" then
+        WhoDat.debugSummary[counterKey] = 0
+    end
+
+    WhoDat.debugSummary[counterKey] = WhoDat.debugSummary[counterKey] + (amount or 1)
+end
+
+local function IncrementTimeoutReason(reason)
+    if type(reason) ~= "string" or reason == "" then
+        reason = "unknown"
+    end
+
+    local timeoutReasons = WhoDat.debugSummary.timeoutReasons
+    timeoutReasons[reason] = (timeoutReasons[reason] or 0) + 1
+end
+
+local function TrackPeerSeen(name, source)
+    local normalizedName = NormalizeName(name)
+    if not normalizedName then
+        return
+    end
+
+    WhoDat.peerSeen[normalizedName] = {
+        name = string.match(name, "^([^%-]+)") or name,
+        seenAt = GetTime(),
+        source = source or "addon",
+    }
+end
+
+local function GetConnectedPeerCount(maxAgeSeconds)
+    local now = GetTime()
+    local count = 0
+
+    for normalizedName, entry in pairs(WhoDat.peerSeen) do
+        local seenAt = entry.seenAt or 0
+        if now - seenAt <= maxAgeSeconds then
+            count = count + 1
+        else
+            WhoDat.peerSeen[normalizedName] = nil
+        end
+    end
+
+    return count
+end
+
+local function ResetDebugTracking()
+    WhoDat.methodStats = {}
+    WhoDat.methodStatsStartedAt = GetTime()
+    WhoDat.debugEvents = {}
+    WhoDat.debugSummary = {
+        lookupsStarted = 0,
+        lookupsCompleted = 0,
+        completedFriend = 0,
+        completedWithoutFriend = 0,
+        completedViaPeer = 0,
+        completedViaWhisper = 0,
+        prefillCompleted = 0,
+        timeouts = 0,
+        timeoutReasons = {},
+        peerAssistSent = 0,
+        peerAssistReceived = 0,
+    }
+    WhoDat.lookupSequence = 0
+    WhoDat.peerSeen = {}
+    WhoDat.peerPresencePending = nil
+    WhoDat.lastConnectedPeerCount = 0
+end
+
+local function BuildTimeoutReason(pending, baseReason)
+    local reason = baseReason or "timeout"
+
+    if pending and pending.lastFailureReason then
+        reason = reason .. "|failure:" .. pending.lastFailureReason
+    end
+
+    if pending and pending.addonLookupSentAt and not pending.addonResponseReceivedAt then
+        reason = reason .. "|no_addon_reply"
+    end
+
+    if pending and pending.peerRequestedAt and not pending.peerResponseReceivedAt then
+        reason = reason .. "|no_peer_reply"
+    end
+
+    local prefillSource = pending and pending.prefillData and pending.prefillData.source or nil
+    if type(prefillSource) == "string" and prefillSource ~= "" then
+        reason = reason .. "|prefill:" .. prefillSource
+    end
+
+    return reason
+end
+
+local function RegisterLookupTimeout(pending, baseReason)
+    if not pending or pending.timeoutLogged then
+        return
+    end
+
+    pending.timeoutLogged = true
+    local reason = BuildTimeoutReason(pending, baseReason)
+    IncrementSummaryCounter("timeouts", 1)
+    IncrementTimeoutReason(reason)
+    RecordMethodDiagnostic("lookup:timeout", false, reason, pending.requestName)
+
+    if string.find(reason, "no_peer_reply", 1, true) then
+        RecordMethodDiagnostic("peer:response", false, "timeout_no_response", pending.requestName)
+    end
+
+    if string.find(reason, "no_addon_reply", 1, true) then
+        RecordMethodDiagnostic("addon:whisperResponse", false, "timeout_no_response", pending.requestName)
+    end
+
+    local lookupId = pending.lookupId or 0
+    AddDebugEvent(string.format("lookup #%d timeout for %s (%s)", lookupId, pending.requestName, reason))
+end
+
+local function BuildReasonSummary(reasonMap)
+    if type(reasonMap) ~= "table" then
+        return "none"
+    end
+
+    local reasonItems = {}
+    for reason, count in pairs(reasonMap) do
+        table.insert(reasonItems, {
+            reason = reason,
+            count = count,
+        })
+    end
+
+    if #reasonItems == 0 then
+        return "none"
+    end
+
+    table.sort(reasonItems, function(left, right)
+        if left.count == right.count then
+            return left.reason < right.reason
+        end
+
+        return left.count > right.count
+    end)
+
+    local parts = {}
+    for i = 1, math.min(4, #reasonItems) do
+        table.insert(parts, string.format("%s=%d", reasonItems[i].reason, reasonItems[i].count))
+    end
+
+    return table.concat(parts, "; ")
+end
+
+local function PrintDebugLog()
+    local elapsed = GetTime() - (WhoDat.methodStatsStartedAt or GetTime())
+    local connectedPeers = GetConnectedPeerCount(WhoDat.peerSeenMaxAgeSeconds)
+
+    ChatPrint(string.format("Debug log over %.1fs", elapsed))
+    ChatPrint(string.format(
+        "lookups started=%d completed=%d friend=%d whisper=%d peer=%d fallback=%d prefill=%d timeouts=%d; connected-addons=%d last-load=%d",
+        WhoDat.debugSummary.lookupsStarted or 0,
+        WhoDat.debugSummary.lookupsCompleted or 0,
+        WhoDat.debugSummary.completedFriend or 0,
+        WhoDat.debugSummary.completedViaWhisper or 0,
+        WhoDat.debugSummary.completedViaPeer or 0,
+        WhoDat.debugSummary.completedWithoutFriend or 0,
+        WhoDat.debugSummary.prefillCompleted or 0,
+        WhoDat.debugSummary.timeouts or 0,
+        connectedPeers,
+        WhoDat.lastConnectedPeerCount or 0
+    ))
+    ChatPrint(string.format(
+        "peer-assist sent=%d received=%d; timeout-reasons: %s",
+        WhoDat.debugSummary.peerAssistSent or 0,
+        WhoDat.debugSummary.peerAssistReceived or 0,
+        BuildReasonSummary(WhoDat.debugSummary.timeoutReasons)
+    ))
+
+    local activePendingCount = CountEntries(WhoDat.pending)
+    ChatPrint(string.format("active-pending=%d", activePendingCount))
+    if activePendingCount > 0 then
+        local now = GetTime()
+        local printed = 0
+        for _, pending in pairs(WhoDat.pending) do
+            printed = printed + 1
+            ChatPrint(string.format(
+                "pending #%d %s age=%.1fs addonSent=%s addonReply=%s peerSent=%s peerReply=%s lastFailure=%s prefill=%s",
+                pending.lookupId or 0,
+                pending.requestName or "unknown",
+                now - (pending.startedAt or now),
+                pending.addonLookupSentAt and "yes" or "no",
+                pending.addonResponseReceivedAt and "yes" or "no",
+                pending.peerRequestedAt and "yes" or "no",
+                pending.peerResponseReceivedAt and "yes" or "no",
+                pending.lastFailureReason or "none",
+                (pending.prefillData and pending.prefillData.source) or "none"
+            ))
+
+            if printed >= 8 then
+                break
+            end
+        end
+    end
+
+    for _, methodName in ipairs(METHOD_LOG_ORDER) do
+        local stat = WhoDat.methodStats[methodName]
+        if stat then
+            ChatPrint(string.format(
+                "%s attempts=%d success=%d fail=%d unavailable=%d players=%d reasons=%s",
+                methodName,
+                stat.attempts,
+                stat.success,
+                stat.fail,
+                stat.unavailable,
+                stat.uniquePlayers,
+                BuildReasonSummary(stat.reasons)
+            ))
+        end
+    end
+
+    local extraMethods = {}
+    for methodName in pairs(WhoDat.methodStats) do
+        if not METHOD_LOG_KNOWN[methodName] then
+            table.insert(extraMethods, methodName)
+        end
+    end
+
+    table.sort(extraMethods)
+    for _, methodName in ipairs(extraMethods) do
+        local stat = WhoDat.methodStats[methodName]
+        ChatPrint(string.format(
+            "%s attempts=%d success=%d fail=%d unavailable=%d players=%d reasons=%s",
+            methodName,
+            stat.attempts,
+            stat.success,
+            stat.fail,
+            stat.unavailable,
+            stat.uniquePlayers,
+            BuildReasonSummary(stat.reasons)
+        ))
+    end
+
+    if #WhoDat.debugEvents > 0 then
+        ChatPrint("recent-events:")
+        local startIndex = #WhoDat.debugEvents - 14
+        if startIndex < 1 then
+            startIndex = 1
+        end
+
+        for i = startIndex, #WhoDat.debugEvents do
+            ChatPrint(WhoDat.debugEvents[i])
+        end
+    end
 end
 
 local function DebugPrint(message)
@@ -679,7 +1044,7 @@ end
 
 local function GetChannelMemberInfoSummaryData(channelId, memberIndex)
     if type(GetChannelMemberInfo) ~= "function" then
-
+        RecordMethodDiagnostic("channel:GetChannelMemberInfo", false, "unavailable")
         return nil
     end
 
@@ -691,7 +1056,11 @@ local function GetChannelMemberInfoSummaryData(channelId, memberIndex)
     end
 
     if (not ok) or type(name) ~= "string" or name == "" then
-
+        RecordMethodDiagnostic(
+            "channel:GetChannelMemberInfo",
+            false,
+            usedFallbackOrder and "no_result_after_swap" or "no_result"
+        )
         return nil
     end
 
@@ -715,13 +1084,19 @@ local function GetChannelMemberInfoSummaryData(channelId, memberIndex)
         online = ParseOnlineFlag(connected),
     }
 
+    RecordMethodDiagnostic(
+        "channel:GetChannelMemberInfo",
+        true,
+        usedFallbackOrder and "ok_arg_swap" or "ok",
+        summaryData.name
+    )
 
     return summaryData
 end
 
 local function GetChannelRosterInfoSummaryData(channelId, memberIndex)
     if type(GetChannelRosterInfo) ~= "function" then
-
+        RecordMethodDiagnostic("channel:GetChannelRosterInfo", false, "unavailable")
         return nil
     end
 
@@ -733,7 +1108,11 @@ local function GetChannelRosterInfoSummaryData(channelId, memberIndex)
     end
 
     if (not ok) or type(a) ~= "string" or a == "" then
-
+        RecordMethodDiagnostic(
+            "channel:GetChannelRosterInfo",
+            false,
+            usedFallbackOrder and "no_result_after_swap" or "no_result"
+        )
         return nil
     end
 
@@ -763,6 +1142,12 @@ local function GetChannelRosterInfoSummaryData(channelId, memberIndex)
         end
     end
 
+    RecordMethodDiagnostic(
+        "channel:GetChannelRosterInfo",
+        true,
+        usedFallbackOrder and "ok_arg_swap" or "ok",
+        summaryData.name
+    )
 
     return summaryData
 end
@@ -975,11 +1360,13 @@ end
 
 local function GetSummaryFromGuidApi(playerGuid, nameHint)
     if type(GetPlayerInfoByGUID) ~= "function" then
+        RecordMethodDiagnostic("guid:GetPlayerInfoByGUID", false, "unavailable", nameHint)
         return nil
     end
 
     local ok, localizedClass, englishClass, localizedRace, _, _, guidName = pcall(GetPlayerInfoByGUID, playerGuid)
     if not ok then
+        RecordMethodDiagnostic("guid:GetPlayerInfoByGUID", false, "pcall_error", nameHint)
         return nil
     end
 
@@ -991,6 +1378,7 @@ local function GetSummaryFromGuidApi(playerGuid, nameHint)
 
     local resolvedName = guidName or nameHint
     if not resolvedName or resolvedName == "" then
+        RecordMethodDiagnostic("guid:GetPlayerInfoByGUID", false, "no_name", nameHint)
         return nil
     end
 
@@ -1003,6 +1391,7 @@ local function GetSummaryFromGuidApi(playerGuid, nameHint)
         source = "guid",
     }
 
+    RecordMethodDiagnostic("guid:GetPlayerInfoByGUID", true, "ok", summaryData.name)
     return summaryData
 end
 
@@ -1097,19 +1486,19 @@ end
 local function RequestAddonWhisperLookup(playerName, pending)
     local normalizedName = NormalizeName(playerName)
     if not normalizedName then
-
+        RecordMethodDiagnostic("addon:whisperRequest", false, "invalid_name", playerName)
         return false
     end
 
     local now = GetTime()
     local lastQueryAt = WhoDat.lastAddonLookupAt[normalizedName] or 0
     if now - lastQueryAt < WhoDat.addonLookupCooldownSeconds then
-
+        RecordMethodDiagnostic("addon:whisperRequest", false, "cooldown", playerName)
         return false
     end
 
     if type(SendAddonMessage) ~= "function" then
-
+        RecordMethodDiagnostic("addon:whisperRequest", false, "unavailable", playerName)
         return false
     end
 
@@ -1121,9 +1510,11 @@ local function RequestAddonWhisperLookup(playerName, pending)
 
     if sent then
         DebugPrint(string.format("sent addon lookup whisper to %s", playerName))
-
+        RecordMethodDiagnostic("addon:whisperRequest", true, "sent", playerName)
+        AddDebugEvent(string.format("addon whisper request sent for %s", playerName))
     else
-
+        RecordMethodDiagnostic("addon:whisperRequest", false, "send_failed", playerName)
+        AddDebugEvent(string.format("addon whisper request failed for %s", playerName))
     end
 
     return sent
@@ -1178,9 +1569,9 @@ local function GetFriendSummaryData(requestName, index)
     }
 
     if name and name ~= "" then
-
+        RecordMethodDiagnostic("friends:GetFriendInfo", true, "ok", summaryData.name)
     else
-
+        RecordMethodDiagnostic("friends:GetFriendInfo", false, "no_name", summaryData.name)
     end
 
     return summaryData
@@ -1533,6 +1924,53 @@ local function ParsePeerLookupRequestMessage(message)
     return requesterName, requestId, targetName
 end
 
+local function BuildPeerPresencePingId()
+    WhoDat.peerPresencePingSequence = (WhoDat.peerPresencePingSequence or 0) + 1
+    return string.format("%d-%d", math.floor(GetTime() * 100), WhoDat.peerPresencePingSequence)
+end
+
+local function BuildPeerPresencePingMessage(requesterName, pingId)
+    return string.format(
+        "NP\t%s\t%s",
+        SanitizeAddonField(requesterName),
+        SanitizeAddonField(pingId)
+    )
+end
+
+local function ParsePeerPresencePingMessage(message)
+    if type(message) ~= "string" then
+        return nil
+    end
+
+    local requesterName, pingId = string.match(message, "^NP\t([^\t]*)\t(.*)$")
+    if not requesterName or requesterName == "" or not pingId or pingId == "" then
+        return nil
+    end
+
+    return requesterName, pingId
+end
+
+local function BuildPeerPresenceAckMessage(requesterName, pingId)
+    return string.format(
+        "NA\t%s\t%s",
+        SanitizeAddonField(requesterName),
+        SanitizeAddonField(pingId)
+    )
+end
+
+local function ParsePeerPresenceAckMessage(message)
+    if type(message) ~= "string" then
+        return nil
+    end
+
+    local requesterName, pingId = string.match(message, "^NA\t([^\t]*)\t(.*)$")
+    if not requesterName or requesterName == "" or not pingId or pingId == "" then
+        return nil
+    end
+
+    return requesterName, pingId
+end
+
 local function BuildPeerLookupResponseMessage(requesterName, requestId, targetName, summaryData)
     local levelText = ""
     if summaryData and summaryData.level and summaryData.level > 0 then
@@ -1663,37 +2101,37 @@ end
 
 local function SendPeerLookupRequest(targetName, pending)
     if not WhoDat.peerLookupEnabled then
-
+        RecordMethodDiagnostic("peer:request", false, "disabled", targetName)
         return false
     end
 
     local normalizedName = NormalizeName(targetName)
     if not normalizedName then
-
+        RecordMethodDiagnostic("peer:request", false, "invalid_name", targetName)
         return false
     end
 
     local now = GetTime()
     local lastLookupAt = WhoDat.lastPeerLookupAt[normalizedName] or 0
     if now - lastLookupAt < WhoDat.peerRequestCooldownSeconds then
-
+        RecordMethodDiagnostic("peer:request", false, "cooldown", targetName)
         return false
     end
 
     if type(SendAddonMessage) ~= "function" then
-
+        RecordMethodDiagnostic("peer:request", false, "unavailable", targetName)
         return false
     end
 
     local channelId, channelName = GetPreferredPeerChannel()
     if not channelId then
-
+        RecordMethodDiagnostic("peer:request", false, "no_channel", targetName)
         return false
     end
 
     local requesterName = UnitName("player")
     if not requesterName or requesterName == "" then
-
+        RecordMethodDiagnostic("peer:request", false, "no_requester", targetName)
         return false
     end
 
@@ -1701,7 +2139,8 @@ local function SendPeerLookupRequest(targetName, pending)
     local requestMessage = BuildPeerLookupRequestMessage(requesterName, requestId, targetName)
     local sent = SendWhoDatAddonMessage(requestMessage, "CHANNEL", channelId)
     if not sent then
-
+        RecordMethodDiagnostic("peer:request", false, "send_failed", targetName)
+        AddDebugEvent(string.format("peer request send failed for %s on %s", targetName, channelName or "channel"))
         return false
     end
 
@@ -1713,6 +2152,8 @@ local function SendPeerLookupRequest(targetName, pending)
         pending.peerChannel = channelName
     end
 
+    RecordMethodDiagnostic("peer:request", true, "sent", targetName)
+    AddDebugEvent(string.format("peer request sent for %s on %s", targetName, channelName))
     DebugPrint(string.format("broadcast peer lookup for %s on %s", targetName, channelName))
     return true
 end
@@ -1731,7 +2172,59 @@ local function SendPeerLookupResponse(requesterName, requestId, targetName, summ
     return SendWhoDatAddonMessage(responseMessage, "CHANNEL", channelId)
 end
 
+local function StartPeerPresencePing()
+    if not WhoDat.peerLookupEnabled then
+        WhoDat.lastConnectedPeerCount = 0
+        ChatPrint("Connected WhoDat addons: peer mode disabled.")
+        AddDebugEvent("presence ping skipped (peer mode disabled)")
+        return
+    end
+
+    if type(SendAddonMessage) ~= "function" then
+        WhoDat.lastConnectedPeerCount = 0
+        ChatPrint("Connected WhoDat addons: addon communication API unavailable.")
+        AddDebugEvent("presence ping skipped (addon comm unavailable)")
+        return
+    end
+
+    local requesterName = UnitName("player")
+    if not requesterName or requesterName == "" then
+        return
+    end
+
+    local channelId, channelName = GetPreferredPeerChannel()
+    if not channelId then
+        WhoDat.lastConnectedPeerCount = 0
+        ChatPrint("Connected WhoDat addons: 0 (no shared channel).")
+        AddDebugEvent("presence ping skipped (no channel)")
+        return
+    end
+
+    local pingId = BuildPeerPresencePingId()
+    local pingMessage = BuildPeerPresencePingMessage(requesterName, pingId)
+    local sent = SendWhoDatAddonMessage(pingMessage, "CHANNEL", channelId)
+    if not sent then
+        WhoDat.lastConnectedPeerCount = 0
+        ChatPrint(string.format("Connected WhoDat addons on %s: 0 (ping send failed).", channelName))
+        AddDebugEvent(string.format("presence ping send failed on %s", channelName))
+        return
+    end
+
+    WhoDat.peerPresencePending = {
+        id = pingId,
+        startedAt = GetTime(),
+        channelName = channelName,
+        responders = {},
+    }
+
+    AddDebugEvent(string.format("presence ping sent on %s", channelName))
+end
+
 local function HasPendingLookups()
+    if WhoDat.peerPresencePending then
+        return true
+    end
+
     for _ in pairs(WhoDat.pending) do
         return true
     end
@@ -1840,7 +2333,15 @@ HandleFriendLookupFailureMessage = function(message)
         return false
     end
 
+    pending.lastFailureReason = reason
+
     DebugPrint(string.format("friend lookup failed early (%s): %s", reason, message))
+    AddDebugEvent(string.format(
+        "lookup #%d friend failure for %s: %s",
+        pending.lookupId or 0,
+        pending.requestName or "unknown",
+        reason
+    ))
 
     if reason == "wrong_faction" then
         pending.addedTemporarily = false
@@ -1879,6 +2380,11 @@ end
 local function CompleteLookup(normalizedName, pending, friendIndex, summaryData)
     local finalData = summaryData or GetMergedPendingSummaryData(pending, friendIndex)
 
+    IncrementSummaryCounter("lookupsCompleted", 1)
+    IncrementSummaryCounter("completedFriend", 1)
+    RecordMethodDiagnostic("lookup:complete", true, "friend", pending and pending.requestName)
+    AddDebugEvent(string.format("lookup #%d completed via friend for %s", pending.lookupId or 0, pending.requestName))
+
     ChatPrint(BuildSummary(finalData))
 
     if pending.addedTemporarily then
@@ -1899,6 +2405,35 @@ local function CompleteLookupWithoutFriend(normalizedName, pending, summaryData)
         online = true,
         source = "addon",
     }
+
+    local completionReason = "without_friend"
+    local source = finalData.source or ""
+    if string.find(source, "addon:peer", 1, true) then
+        completionReason = "peer"
+        IncrementSummaryCounter("completedViaPeer", 1)
+        if pending.peerResponderName then
+            IncrementSummaryCounter("peerAssistReceived", 1)
+            RecordMethodDiagnostic("peer:assist-in", true, "received", pending.requestName)
+            AddDebugEvent(string.format(
+                "lookup #%d requester got peer data for %s from %s",
+                pending.lookupId or 0,
+                pending.requestName,
+                pending.peerResponderName
+            ))
+        else
+            AddDebugEvent(string.format("lookup #%d completed via peer for %s", pending.lookupId or 0, pending.requestName))
+        end
+    elseif string.find(source, "addon:whisper", 1, true) then
+        completionReason = "addon_whisper"
+        IncrementSummaryCounter("completedViaWhisper", 1)
+        AddDebugEvent(string.format("lookup #%d completed via addon whisper for %s", pending.lookupId or 0, pending.requestName))
+    else
+        IncrementSummaryCounter("completedWithoutFriend", 1)
+        AddDebugEvent(string.format("lookup #%d completed without friend for %s", pending.lookupId or 0, pending.requestName))
+    end
+
+    IncrementSummaryCounter("lookupsCompleted", 1)
+    RecordMethodDiagnostic("lookup:complete", true, completionReason, pending and pending.requestName)
 
     ChatPrint(BuildSummary(finalData))
 
@@ -1959,11 +2494,15 @@ local function StartLookup(playerName)
 
     if WhoDat.pending[normalizedName] then
         ChatPrint(string.format("%s: lookup already in progress.", playerName))
+        AddDebugEvent(string.format("lookup skipped for %s (already pending)", playerName))
         return
     end
 
     local existingFriendIndex = GetFriendIndexByName(playerName)
     if existingFriendIndex then
+        IncrementSummaryCounter("prefillCompleted", 1)
+        RecordMethodDiagnostic("lookup:complete", true, "already_friend", playerName)
+        AddDebugEvent(string.format("lookup immediate friend hit for %s", playerName))
         ChatPrint(BuildSummary(GetFriendSummaryData(playerName, existingFriendIndex)))
         return
     end
@@ -1978,11 +2517,17 @@ local function StartLookup(playerName)
     end
 
     if prefillData and IsOfflineStateReliable(prefillData, nil) then
+        IncrementSummaryCounter("prefillCompleted", 1)
+        RecordMethodDiagnostic("lookup:complete", true, "prefill_offline", playerName)
+        AddDebugEvent(string.format("lookup prefill offline for %s", playerName))
         ChatPrint(BuildSummary(prefillData))
         return
     end
 
     if HasMinimumInfo(prefillData) then
+        IncrementSummaryCounter("prefillCompleted", 1)
+        RecordMethodDiagnostic("lookup:complete", true, "prefill_minimum", playerName)
+        AddDebugEvent(string.format("lookup prefill complete for %s", playerName))
         ChatPrint(BuildSummary(prefillData))
         return
     end
@@ -1990,25 +2535,47 @@ local function StartLookup(playerName)
     local totalFriends = GetNumFriends() or 0
     if MAX_FRIENDS and totalFriends >= MAX_FRIENDS then
         if prefillData then
+            IncrementSummaryCounter("prefillCompleted", 1)
+            AddDebugEvent(string.format("lookup prefill used for %s (friend list full)", playerName))
             ChatPrint(BuildSummary(prefillData))
             ChatPrint(string.format("%s: friend list is full, could not enrich with temporary friend lookup.", playerName))
         else
+            AddDebugEvent(string.format("lookup failed for %s (friend list full)", playerName))
             ChatPrint(string.format("%s: friend list is full, cannot do temporary lookup.", playerName))
         end
         return
     end
 
+    WhoDat.lookupSequence = (WhoDat.lookupSequence or 0) + 1
+    local lookupId = WhoDat.lookupSequence
+
     WhoDat.pending[normalizedName] = {
+        lookupId = lookupId,
         requestName = playerName,
         startedAt = GetTime(),
         friendAddRequestedAt = GetTime(),
         addedTemporarily = true,
         prefillData = prefillData,
+        timeoutLogged = false,
+        lastFailureReason = nil,
     }
 
-    RequestAddonWhisperLookup(playerName, WhoDat.pending[normalizedName])
+    IncrementSummaryCounter("lookupsStarted", 1)
+    RecordMethodDiagnostic("lookup:start", true, "pending", playerName)
+    AddDebugEvent(string.format("lookup #%d started for %s", lookupId, playerName))
+
+    local pending = WhoDat.pending[normalizedName]
+    local addonSent = RequestAddonWhisperLookup(playerName, pending)
+    pending.addonLookupAttempted = true
+    pending.addonLookupSucceeded = addonSent
+
     if WhoDat.peerLookupEnabled then
-        SendPeerLookupRequest(playerName, WhoDat.pending[normalizedName])
+        local peerSent = SendPeerLookupRequest(playerName, pending)
+        pending.peerLookupAttempted = true
+        pending.peerLookupSucceeded = peerSent
+    else
+        pending.peerLookupAttempted = false
+        pending.peerLookupSucceeded = false
     end
 
     QueueFriendSystemMessageSuppression(playerName, "add")
@@ -2027,6 +2594,18 @@ function WhoDat:OnUpdate(elapsed)
     PrunePeerRecentRequests()
 
     local now = GetTime()
+    if self.peerPresencePending and now - self.peerPresencePending.startedAt >= self.peerPresencePingWaitSeconds then
+        local connectedCount = GetTableCount(self.peerPresencePending.responders)
+        self.lastConnectedPeerCount = connectedCount
+        ChatPrint(string.format("Connected WhoDat addons on %s: %d.", self.peerPresencePending.channelName or "channel", connectedCount))
+        AddDebugEvent(string.format(
+            "presence ping complete on %s: %d responders",
+            self.peerPresencePending.channelName or "channel",
+            connectedCount
+        ))
+        self.peerPresencePending = nil
+    end
+
     for normalizedName, pending in pairs(self.pending) do
         local blockedPendingHandled = false
         if pending.friendLookupBlockedAt then
@@ -2044,12 +2623,14 @@ function WhoDat:OnUpdate(elapsed)
 
                 if not printedSummary then
                     if pending.peerRequestedAt then
+                        RegisterLookupTimeout(pending, "peer_no_response_after_wrong_faction")
 
                         ChatPrint(string.format(
                             "%s is online, but cross-faction details are unavailable on this server: no peer response.",
                             pending.requestName
                         ))
                     else
+                        RegisterLookupTimeout(pending, "wrong_faction_no_peer_channel")
                         ChatPrint(string.format(
                             "%s: cross-faction lookup is blocked and no shared peer channel is available.",
                             pending.requestName
@@ -2075,6 +2656,7 @@ function WhoDat:OnUpdate(elapsed)
                 if HasPartialIdentityInfo(pending.prefillData) then
                     ChatPrint(BuildSummary(pending.prefillData))
                 else
+                    RegisterLookupTimeout(pending, "fast_fallback_missing_identity")
                     local detailParts = {}
                     if pending.addonLookupSentAt then
 
@@ -2122,6 +2704,7 @@ function WhoDat:OnUpdate(elapsed)
             end
 
             if not printedSummary then
+                RegisterLookupTimeout(pending, "lookup_timeout_no_data")
                 ChatPrint(string.format("%s: lookup timed out; player not found or server returned no data.", pending.requestName))
             end
 
@@ -2229,8 +2812,32 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
         return
     end
 
+    TrackPeerSeen(senderName, distribution or "addon")
+
     if self.peerLookupEnabled then
         PrunePeerRecentRequests()
+
+        local pingRequesterName, pingId = ParsePeerPresencePingMessage(message)
+        if pingRequesterName then
+            if NormalizeName(pingRequesterName) ~= NormalizeName(ownName) then
+                local channelId = select(1, GetPreferredPeerChannel())
+                if channelId then
+                    local ackMessage = BuildPeerPresenceAckMessage(pingRequesterName, pingId)
+                    SendWhoDatAddonMessage(ackMessage, "CHANNEL", channelId)
+                end
+            end
+            return
+        end
+
+        local ackRequesterName, ackId = ParsePeerPresenceAckMessage(message)
+        if ackRequesterName then
+            if NormalizeName(ackRequesterName) == NormalizeName(ownName)
+                and self.peerPresencePending
+                and self.peerPresencePending.id == ackId then
+                self.peerPresencePending.responders[NormalizeName(senderName)] = senderName
+            end
+            return
+        end
 
         local requesterName, requestId, targetName = ParsePeerLookupRequestMessage(message)
         if requesterName then
@@ -2248,7 +2855,18 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
             if summaryData then
                 local sent = SendPeerLookupResponse(requesterName, requestId, targetName, summaryData)
                 if sent then
+                    IncrementSummaryCounter("peerAssistSent", 1)
+                    RecordMethodDiagnostic("peer:assist-out", true, "sent", targetName)
+                    AddDebugEvent(string.format(
+                        "peer assist sent for %s to %s (source=%s)",
+                        targetName,
+                        requesterName,
+                        summaryData.source or "unknown"
+                    ))
                     DebugPrint(string.format("answered peer lookup for %s", targetName))
+                else
+                    RecordMethodDiagnostic("peer:assist-out", false, "send_failed", targetName)
+                    AddDebugEvent(string.format("peer assist send failed for %s to %s", targetName, requesterName))
                 end
             end
             return
@@ -2261,6 +2879,7 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
             end
 
             if responseData then
+                RecordMethodDiagnostic("peer:response", true, "received", responseTargetName)
                 StoreCachedSummaryData(responseTargetName, responseData)
                 TrackChatPresence(responseTargetName, "addon:peer")
             end
@@ -2271,6 +2890,16 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
                 if pending.peerRequestId and pending.peerRequestId ~= responseRequestId then
                     return
                 end
+
+                pending.peerResponseReceivedAt = GetTime()
+                pending.peerResponderName = senderName
+                AddDebugEvent(string.format(
+                    "peer response received for lookup #%d (%s) from %s",
+                    pending.lookupId or 0,
+                    pending.requestName,
+                    senderName
+                ))
+                DebugPrint(string.format("peer lookup succeeded for %s via %s", pending.requestName, senderName))
 
                 local mergedData = MergeSummaryData(responseData, pending.prefillData)
                 pending.prefillData = mergedData
@@ -2298,6 +2927,8 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
         return
     end
 
+    RecordMethodDiagnostic("addon:whisperResponse", true, "received", senderName)
+
     responseData.name = senderName
     StoreCachedSummaryData(senderName, responseData)
     TrackChatPresence(senderName, "addon:whisper")
@@ -2305,6 +2936,8 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
     local normalizedName = NormalizeName(senderName)
     local pending = normalizedName and self.pending[normalizedName] or nil
     if pending then
+        pending.addonResponseReceivedAt = GetTime()
+        AddDebugEvent(string.format("addon whisper response received for lookup #%d (%s)", pending.lookupId or 0, pending.requestName))
         local mergedData = MergeSummaryData(responseData, pending.prefillData)
         CompleteLookupWithoutFriend(normalizedName, pending, mergedData)
     end
@@ -2314,7 +2947,7 @@ function WhoDat:HandleSlashCommand(message)
     local playerName = ParseSlashName(message)
     if not playerName then
         ChatPrint("Usage: /whodat PlayerName")
-        ChatPrint("       /whodat debug on|off|status")
+        ChatPrint("       /whodat debug on|off|status|log|reset")
         return
     end
 
@@ -2328,14 +2961,21 @@ function WhoDat:HandleSlashCommand(message)
         elseif debugArg == "off" then
             self.debugEnabled = false
             ChatPrint("Debug mode disabled.")
+        elseif debugArg == "log" then
+            PrintDebugLog()
+        elseif debugArg == "reset" then
+            ResetDebugTracking()
+            ChatPrint("Debug log counters reset.")
         else
             local peerChannelName = "disabled"
             if self.peerLookupEnabled then
                 _, peerChannelName = GetPreferredPeerChannel()
             end
 
+            local connectedPeers = GetConnectedPeerCount(self.peerSeenMaxAgeSeconds)
+
             ChatPrint(string.format(
-                "Debug status: %s; filter api: %s; added-pattern: %s; removed-pattern: %s; channel-member-api: %s; channel-roster-api: %s; guid-api: %s; addon-whisper-api: %s; prefix: %s; peer: %s; peer-channel: %s; peer-requests: %d; channel-cache: %d; chat-presence: %d.",
+                "Debug status: %s; filter api: %s; added-pattern: %s; removed-pattern: %s; channel-member-api: %s; channel-roster-api: %s; guid-api: %s; addon-whisper-api: %s; prefix: %s; peer: %s; peer-channel: %s; peer-requests: %d; channel-cache: %d; chat-presence: %d; connected-addons: %d; load-connected: %d.",
                 self.debugEnabled and "on" or "off",
                 ChatFrameAddMessageEventFilter and "available" or "missing",
                 FRIEND_ADDED_PATTERN and "ok" or "missing",
@@ -2349,7 +2989,9 @@ function WhoDat:HandleSlashCommand(message)
                 peerChannelName or "missing",
                 GetTableCount(self.peerRecentRequests),
                 GetTableCount(self.channelCache),
-                GetTableCount(self.recentChatPresence)
+                GetTableCount(self.recentChatPresence),
+                connectedPeers,
+                self.lastConnectedPeerCount or 0
             ))
         end
         return
@@ -2362,6 +3004,7 @@ function WhoDat:HandlePlayerLogin()
     WhoDatDB = WhoDatDB or {}
     WhoDatDB.channelCache = WhoDatDB.channelCache or {}
     self.channelCache = WhoDatDB.channelCache
+    ResetDebugTracking()
 
     if ChatFrameAddMessageEventFilter then
         ChatFrameAddMessageEventFilter("CHAT_MSG_SYSTEM", SystemMessageFilter)
@@ -2386,6 +3029,9 @@ function WhoDat:HandlePlayerLogin()
     SlashCmdList["WHODAT"] = function(message)
         WhoDat:HandleSlashCommand(message)
     end
+
+    StartPeerPresencePing()
+    SetLookupTicker(true)
 
     ChatPrint("Loaded. Shift-click a player name or use /whodat Name to query level/class/location.")
 end
