@@ -15,6 +15,8 @@ WhoDat.peerChannelMinLevel = 8
 WhoDat.peerWhisperMinLevel = 9
 WhoDat.peerChannelJoinRetrySeconds = 10
 WhoDat.peerChannelHelloCooldownSeconds = 30
+WhoDat.peerStartupHelloWindowSeconds = 45
+WhoDat.peerStartupHelloRetrySeconds = 3
 WhoDat.peerRosterProbeCooldownSeconds = 30
 WhoDat.peerRosterProbeMaxTargetsPerRun = 12
 WhoDat.peerMemberMaxAgeSeconds = 180
@@ -31,6 +33,9 @@ WhoDat.lastPeerChannelJoinAttemptAt = 0
 WhoDat.lastPeerChannelHelloAt = 0
 WhoDat.lastPeerChannelHelloEchoAt = 0
 WhoDat.lastPeerChannelHelloAttemptAt = 0
+WhoDat.peerStartupHelloDeadlineAt = 0
+WhoDat.peerStartupHelloDone = false
+WhoDat.lastPeerStartupHelloTryAt = 0
 WhoDat.lastPeerRosterProbeAt = 0
 WhoDat.peerRequestSequence = 0
 WhoDat.pending = {}
@@ -38,6 +43,7 @@ WhoDat.channelCache = {}
 WhoDat.recentChatPresence = {}
 WhoDat.peerChannelMembers = {}
 WhoDat.peerFactionCache = {}
+WhoDat.peerAddonConfirmed = {}
 WhoDat.lastPeerLookupAt = {}
 WhoDat.methodStats = {}
 WhoDat.methodStatsStartedAt = 0
@@ -1157,34 +1163,19 @@ local function ChooseRandomPeerByFaction(faction)
     local selectedName = nil
     local candidateCount = 0
 
-    for normalizedName, entry in pairs(WhoDat.peerFactionCache) do
-        if entry and entry.faction == targetFaction and normalizedName ~= selfNormalized and WhoDat.peerChannelMembers[normalizedName] then
-            candidateCount = candidateCount + 1
-            if math.random(candidateCount) == 1 then
-                selectedName = entry.name
-            end
-        end
-    end
-
-    return selectedName
-end
-
-local function ChooseRandomUnknownFactionPeer()
-    local selfNormalized = NormalizeName(UnitName("player") or "")
-    local selectedName = nil
-    local candidateCount = 0
     local minWhisperLevel = WhoDat.peerWhisperMinLevel or 9
 
-    for normalizedName, memberEntry in pairs(WhoDat.peerChannelMembers) do
-        if normalizedName ~= selfNormalized and memberEntry and memberEntry.name and memberEntry.name ~= "" then
-            local knownFactionEntry = WhoDat.peerFactionCache[normalizedName]
-            if not knownFactionEntry then
-                local knownLevel = GetKnownPeerChannelMemberLevel(memberEntry.name)
-                if (not knownLevel) or knownLevel >= minWhisperLevel then
-                    candidateCount = candidateCount + 1
-                    if math.random(candidateCount) == 1 then
-                        selectedName = memberEntry.name
-                    end
+    for normalizedName, entry in pairs(WhoDat.peerFactionCache) do
+        if entry
+            and entry.faction == targetFaction
+            and normalizedName ~= selfNormalized
+            and WhoDat.peerChannelMembers[normalizedName]
+            and WhoDat.peerAddonConfirmed[normalizedName] then
+            local knownLevel = GetKnownPeerChannelMemberLevel(entry.name)
+            if (not knownLevel) or knownLevel >= minWhisperLevel then
+                candidateCount = candidateCount + 1
+                if math.random(candidateCount) == 1 then
+                    selectedName = entry.name
                 end
             end
         end
@@ -1462,6 +1453,36 @@ local function SendWhodatChannelHello(channelId, channelName, forceSend)
         tostring(languageTarget)
     ))
     return true, nil
+end
+
+local function TryStartupWhodatHello(channelId, channelName)
+    local deadlineAt = WhoDat.peerStartupHelloDeadlineAt or 0
+    if deadlineAt <= 0 or WhoDat.peerStartupHelloDone then
+        return false
+    end
+
+    local now = GetTime()
+    if now > deadlineAt then
+        WhoDat.peerStartupHelloDone = true
+        WhoDat.peerStartupHelloDeadlineAt = 0
+        return false
+    end
+
+    local retrySeconds = WhoDat.peerStartupHelloRetrySeconds or 3
+    local lastTryAt = WhoDat.lastPeerStartupHelloTryAt or 0
+    if lastTryAt > 0 and now - lastTryAt < retrySeconds then
+        return false
+    end
+
+    WhoDat.lastPeerStartupHelloTryAt = now
+
+    local sent, reason = SendWhodatChannelHello(channelId, channelName, true)
+    if sent or reason == "cooldown" or reason == "level_gated" then
+        WhoDat.peerStartupHelloDone = true
+        WhoDat.peerStartupHelloDeadlineAt = 0
+    end
+
+    return sent
 end
 
 local function GetTableCount(tableValue)
@@ -1820,6 +1841,7 @@ SyncWhodatPeerMembership = function(channelId, channelName)
         if now - seenAt > maxMemberAge then
             WhoDat.peerChannelMembers[normalizedName] = nil
             WhoDat.peerFactionCache[normalizedName] = nil
+            WhoDat.peerAddonConfirmed[normalizedName] = nil
         end
     end
 end
@@ -2496,17 +2518,7 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
 
     local peerName = ChooseRandomPeerByFaction(targetFaction)
     if not peerName then
-        peerName = ChooseRandomUnknownFactionPeer()
-        if not peerName then
-            return false, "no_peer_data"
-        end
-
-        AddDebugEvent(string.format(
-            "lookup #%d using unknown-faction peer %s for %s",
-            pending.lookupId or 0,
-            peerName,
-            pending.requestName
-        ))
+        return false, "no_peer_data"
     end
 
     local requestId = BuildPeerRequestId()
@@ -2985,9 +2997,13 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
 
     TrackPeerChannelMember(sender)
 
+    local normalizedSender = NormalizeName(sender)
+    if normalizedSender then
+        WhoDat.peerAddonConfirmed[normalizedSender] = GetTime()
+    end
+
     local faction = ParsePeerFactionMessage(message)
     if faction then
-        local normalizedSender = NormalizeName(sender)
         local wasKnown = normalizedSender and WhoDat.peerFactionCache[normalizedSender] ~= nil
         if SetPeerFaction(sender, faction, "addon:faction") then
             AddDebugEvent(string.format("peer faction learned from %s (%s)", sender, faction))
@@ -3038,6 +3054,8 @@ function WhoDat:HandleChatMessageEvent(event, ...)
                         local echoAt = GetTime()
                         WhoDat.lastPeerChannelHelloAt = echoAt
                         WhoDat.lastPeerChannelHelloEchoAt = echoAt
+                        WhoDat.peerStartupHelloDone = true
+                        WhoDat.peerStartupHelloDeadlineAt = 0
                         AddDebugEvent(string.format("peer hello echo confirmed (%s)", helloFaction))
                     else
                         if SetPeerFaction(sender, helloFaction, "channel:hello") then
@@ -3082,6 +3100,7 @@ function WhoDat:HandleChannelRosterUpdate(channelId)
 
     if IsWhodatChannelName(channelName) then
         SyncWhodatPeerMembership(numericChannelId, channelName)
+        TryStartupWhodatHello(numericChannelId, channelName)
     end
 end
 
@@ -3108,6 +3127,7 @@ function WhoDat:HandleChannelSystemEvent(event, ...)
     local channelId, channelName = EnsureWhodatChannelJoined(false)
     if channelId then
         SyncWhodatPeerMembership(channelId, channelName)
+        TryStartupWhodatHello(channelId, channelName)
     end
 end
 
@@ -3131,6 +3151,8 @@ function WhoDat:HandleSlashCommand(message)
         SyncWhodatPeerMembership(channelId, channelName)
         local sent, reason = SendWhodatChannelHello(channelId, channelName, true)
         if sent then
+            self.peerStartupHelloDone = true
+            self.peerStartupHelloDeadlineAt = 0
             local myFaction = GetPlayerFaction() or "Unknown"
             ChatPrint(string.format("Hello attempt sent to %s.", channelName or WhoDat.peerChannelName))
             ChatPrint(string.format("If WDHELLO is still not visible, type this manually once: /%d WDHELLO %s", channelId, myFaction))
@@ -3183,6 +3205,15 @@ function WhoDat:HandleSlashCommand(message)
                     helloStatus = string.format("unconfirmed:%ds", ageSeconds)
                 end
             end
+            if not self.peerStartupHelloDone then
+                local startupDeadlineAt = self.peerStartupHelloDeadlineAt or 0
+                if startupDeadlineAt > 0 then
+                    local startupRemaining = math.ceil(startupDeadlineAt - GetTime())
+                    if startupRemaining > 0 then
+                        helloStatus = string.format("startup:%ds,%s", startupRemaining, helloStatus)
+                    end
+                end
+            end
             local probeStatus = "idle"
             local lastProbeAt = self.lastPeerRosterProbeAt or 0
             if lastProbeAt > 0 then
@@ -3228,8 +3259,13 @@ function WhoDat:HandlePlayerLogin()
     self.channelCache = WhoDatDB.channelCache
     self.peerChannelMembers = {}
     self.peerFactionCache = {}
+    self.peerAddonConfirmed = {}
+    self.lastPeerChannelHelloAt = 0
     self.lastPeerChannelHelloEchoAt = 0
     self.lastPeerChannelHelloAttemptAt = 0
+    self.peerStartupHelloDeadlineAt = GetTime() + (self.peerStartupHelloWindowSeconds or 45)
+    self.peerStartupHelloDone = false
+    self.lastPeerStartupHelloTryAt = 0
     self.lastPeerRosterProbeAt = 0
     self.lastPeerLookupAt = {}
     ResetDebugTracking()
@@ -3239,7 +3275,7 @@ function WhoDat:HandlePlayerLogin()
     local channelId, channelName = EnsureWhodatChannelJoined(true)
     if channelId then
         SyncWhodatPeerMembership(channelId, channelName)
-        SendWhodatChannelHello(channelId, channelName, false)
+        TryStartupWhodatHello(channelId, channelName)
     end
 
     if ChatFrameAddMessageEventFilter then
