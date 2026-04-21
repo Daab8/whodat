@@ -2369,8 +2369,27 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
         targetFaction = NormalizeFaction(data.faction) or InferFactionFromRace(data.race)
     end
 
+    local myFaction = GetPlayerFaction()
+    if targetFaction and myFaction and targetFaction == myFaction then
+        return false, "same_faction_target"
+    end
+
+    if not targetFaction and pending.lastFailureReason == "wrong_faction" and myFaction then
+        if myFaction == "Horde" then
+            targetFaction = "Alliance"
+        elseif myFaction == "Alliance" then
+            targetFaction = "Horde"
+        end
+    end
+
     if not targetFaction then
         return false, "unknown_target_faction"
+    end
+
+    local channelId, channelName = EnsureWhodatChannelJoined(false)
+    if channelId then
+        SyncWhodatPeerMembership(channelId, channelName)
+        SendWhodatChannelHello(channelId, channelName, false)
     end
 
     local peerName = ChooseRandomPeerByFaction(targetFaction)
@@ -2611,12 +2630,6 @@ local function StartLookup(playerName)
         return
     end
 
-    local channelId, channelName = EnsureWhodatChannelJoined(false)
-    if channelId then
-        SyncWhodatPeerMembership(channelId, channelName)
-        SendWhodatChannelHello(channelId, channelName, false)
-    end
-
     local existingFriendIndex = GetFriendIndexByName(playerName)
     if existingFriendIndex then
         IncrementSummaryCounter("prefillCompleted", 1)
@@ -2675,6 +2688,7 @@ local function StartLookup(playerName)
         friendAddRequestedAt = GetTime(),
         addedTemporarily = true,
         prefillData = prefillData,
+        peerAttempted = false,
         timeoutLogged = false,
         lastFailureReason = nil,
     }
@@ -2727,6 +2741,37 @@ function WhoDat:OnUpdate(elapsed)
             local peerWaitRemaining = (pending.peerRequestedAt + WhoDat.peerLookupResponseWaitSeconds) - now
             if peerWaitRemaining > 0 then
                 timedOut = false
+            end
+        end
+
+        if (not fastFallbackHandled)
+            and (not pending.peerRequestedAt)
+            and (not pending.peerAttempted)
+            and now - pending.startedAt >= (WhoDat.addFriendFailureFallbackSeconds or 3.5) then
+            local peerData = pending.partialData or pending.prefillData
+            local peerTargetFaction = peerData and (NormalizeFaction(peerData.faction) or InferFactionFromRace(peerData.race)) or nil
+            local myFaction = GetPlayerFaction()
+
+            local shouldTryPeer = false
+            if pending.lastFailureReason == "wrong_faction" then
+                shouldTryPeer = true
+            elseif peerTargetFaction and myFaction and peerTargetFaction ~= myFaction then
+                shouldTryPeer = true
+            end
+
+            if shouldTryPeer then
+                pending.peerAttempted = true
+                local peerLookupSent, peerLookupReason = RequestPeerCrossFactionLookup(normalizedName, pending, peerData)
+                if peerLookupSent then
+                    timedOut = false
+                else
+                    AddDebugEvent(string.format(
+                        "lookup #%d peer request skipped for %s (%s)",
+                        pending.lookupId or 0,
+                        pending.requestName,
+                        peerLookupReason or "unknown"
+                    ))
+                end
             end
         end
 
