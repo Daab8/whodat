@@ -12,6 +12,7 @@ WhoDat.channelNilBreakThreshold = 15
 WhoDat.chatPresenceMaxAgeSeconds = 300
 WhoDat.peerChannelName = "whodatdata"
 WhoDat.peerChannelMinLevel = 8
+WhoDat.peerWhisperMinLevel = 9
 WhoDat.peerChannelJoinRetrySeconds = 10
 WhoDat.peerChannelHelloCooldownSeconds = 30
 WhoDat.peerRosterProbeCooldownSeconds = 30
@@ -926,6 +927,16 @@ local function CanSendPeerChannelMessages()
     return type(level) == "number" and level >= WhoDat.peerChannelMinLevel
 end
 
+local function CanSendPeerWhisperMessages()
+    if type(UnitLevel) ~= "function" then
+        return false
+    end
+
+    local level = UnitLevel("player")
+    local minLevel = WhoDat.peerWhisperMinLevel or 9
+    return type(level) == "number" and level >= minLevel
+end
+
 local function RegisterWhoDatAddonPrefix()
     local prefix = WhoDat.addonCommPrefix
     if type(prefix) ~= "string" or prefix == "" then
@@ -986,17 +997,37 @@ local function EnsureWhodatChannelJoined(forceAttempt)
     return GetWhodatChannelInfo()
 end
 
-local function TrackPeerChannelMember(name)
+local function TrackPeerChannelMember(name, level)
     local normalizedName = NormalizeName(name)
     if not normalizedName then
         return
     end
 
+    local existingEntry = WhoDat.peerChannelMembers[normalizedName]
     local shortName = string.match(name, "^([^%-]+)") or name
     WhoDat.peerChannelMembers[normalizedName] = {
         name = shortName,
+        level = ParseLevelValue(level) or (existingEntry and existingEntry.level) or nil,
         seenAt = GetTime(),
     }
+end
+
+local function GetKnownPeerChannelMemberLevel(name)
+    local normalizedName = NormalizeName(name)
+    if not normalizedName then
+        return nil
+    end
+
+    local entry = WhoDat.peerChannelMembers[normalizedName]
+    if not entry then
+        return nil
+    end
+
+    if type(entry.level) == "number" and entry.level > 0 then
+        return entry.level
+    end
+
+    return nil
 end
 
 local function SetPeerFaction(name, faction, source)
@@ -1095,6 +1126,18 @@ end
 local function SendWhoDatAddonMessage(message, distribution, target)
     if type(SendAddonMessage) ~= "function" then
         return false, "unavailable"
+    end
+
+    if distribution == "WHISPER" then
+        if not CanSendPeerWhisperMessages() then
+            return false, "whisper_level_gated"
+        end
+
+        local knownTargetLevel = GetKnownPeerChannelMemberLevel(target)
+        local minLevel = WhoDat.peerWhisperMinLevel or 9
+        if knownTargetLevel and knownTargetLevel < minLevel then
+            return false, "target_level_gated"
+        end
     end
 
     local ok, result = pcall(SendAddonMessage, WhoDat.addonCommPrefix, message, distribution, target)
@@ -1674,7 +1717,7 @@ SyncWhodatPeerMembership = function(channelId, channelName)
 
             local normalizedName = NormalizeName(memberData.name)
             if normalizedName then
-                TrackPeerChannelMember(memberData.name)
+                TrackPeerChannelMember(memberData.name, memberData.level)
                 seenMembers[normalizedName] = true
             end
         else
@@ -1695,7 +1738,7 @@ SyncWhodatPeerMembership = function(channelId, channelName)
             local sourceChannel = string.match(source, "^channel:(.+)$")
             if sourceChannel and IsWhodatChannelName(sourceChannel) then
                 local memberName = cachedData.name or normalizedName
-                TrackPeerChannelMember(memberName)
+                TrackPeerChannelMember(memberName, cachedData.level)
                 seenMembers[normalizedName] = true
             end
         end
@@ -2275,11 +2318,11 @@ local function HandlePeerLookupRequest(senderName, requestId, targetName)
     end
 
     local responseMessage = BuildPeerLookupResponseMessage(requestId, targetName, responseData)
-    local sent = SendWhoDatAddonMessage(responseMessage, "WHISPER", senderName)
+    local sent, sendError = SendWhoDatAddonMessage(responseMessage, "WHISPER", senderName)
     if sent then
         AddDebugEvent(string.format("peer response sent to %s for %s", senderName, targetName))
     else
-        AddDebugEvent(string.format("peer response failed to %s for %s", senderName, targetName))
+        AddDebugEvent(string.format("peer response failed to %s for %s (%s)", senderName, targetName, sendError or "unknown"))
     end
 end
 
@@ -2337,8 +2380,15 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
 
     local requestId = BuildPeerRequestId()
     local requestMessage = BuildPeerLookupRequestMessage(requestId, pending.requestName)
-    local sent = SendWhoDatAddonMessage(requestMessage, "WHISPER", peerName)
+    local sent, sendError = SendWhoDatAddonMessage(requestMessage, "WHISPER", peerName)
     if not sent then
+        AddDebugEvent(string.format(
+            "lookup #%d peer request send failed to %s for %s (%s)",
+            pending.lookupId or 0,
+            peerName,
+            pending.requestName,
+            sendError or "unknown"
+        ))
         return false, "send_failed"
     end
 
@@ -2935,7 +2985,13 @@ function WhoDat:HandleSlashCommand(message)
             local whodatChannelId = select(1, GetWhodatChannelInfo())
             local channelStatus = whodatChannelId and "joined" or "missing"
             local playerLevel = type(UnitLevel) == "function" and (UnitLevel("player") or 0) or 0
-            local sendStatus = CanSendPeerChannelMessages() and "allowed" or string.format("locked(<8):%d", playerLevel)
+            local channelSendStatus = CanSendPeerChannelMessages()
+                and "allowed"
+                or string.format("locked(<%d):%d", self.peerChannelMinLevel or 8, playerLevel)
+            local whisperSendStatus = CanSendPeerWhisperMessages()
+                and "allowed"
+                or string.format("locked(<%d):%d", self.peerWhisperMinLevel or 9, playerLevel)
+            local sendStatus = string.format("channel:%s whisper:%s", channelSendStatus, whisperSendStatus)
             local helloStatus = "never"
             local lastHelloAt = self.lastPeerChannelHelloAt or 0
             if lastHelloAt > 0 then
