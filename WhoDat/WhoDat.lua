@@ -173,7 +173,6 @@ local METHOD_LOG_ORDER = {
     "friends:GetFriendInfo",
     "channel:GetChannelMemberInfo",
     "channel:GetChannelRosterInfo",
-    "guid:GetPlayerInfoByGUID",
 }
 
 local METHOD_LOG_KNOWN = {}
@@ -1327,64 +1326,6 @@ local function ParseWhodatChannelHelloMessage(message)
     return NormalizeFaction(factionText)
 end
 
-local function BuildPeerChannelTransportMessage(payload)
-    if type(payload) ~= "string" or payload == "" then
-        return nil
-    end
-
-    return "WDX " .. payload
-end
-
-local function ParsePeerChannelTransportMessage(message)
-    if type(message) ~= "string" then
-        return nil
-    end
-
-    local payload = string.match(message, "^WDX%s+(.*)$")
-    if not payload or payload == "" then
-        return nil
-    end
-
-    return payload
-end
-
-local function SendPeerChannelTransportMessage(payload)
-    if not CanSendPeerChannelMessages() then
-        return false, "channel_level_gated"
-    end
-
-    if type(SendChatMessage) ~= "function" then
-        return false, "unavailable"
-    end
-
-    local transportMessage = BuildPeerChannelTransportMessage(payload)
-    if not transportMessage then
-        return false, "invalid_payload"
-    end
-
-    local channelId, channelName = EnsureWhodatChannelJoined(false)
-    local numericChannelId = tonumber(channelId)
-    if (not numericChannelId or numericChannelId <= 0) and (type(channelName) ~= "string" or channelName == "") then
-        return false, "no_channel"
-    end
-
-    local sendTarget = numericChannelId and numericChannelId > 0 and numericChannelId or channelName
-    local languageTarget = nil
-    if type(GetDefaultLanguage) == "function" then
-        local defaultLanguage = GetDefaultLanguage("player")
-        if type(defaultLanguage) == "string" and defaultLanguage ~= "" then
-            languageTarget = defaultLanguage
-        end
-    end
-
-    local ok, sendError = pcall(SendChatMessage, transportMessage, "CHANNEL", languageTarget, sendTarget)
-    if not ok then
-        return false, tostring(sendError)
-    end
-
-    return true, nil
-end
-
 local function SendPeerFactionWhisper(targetName, reason)
     local myFaction = GetPlayerFaction()
     if not myFaction or type(targetName) ~= "string" or targetName == "" then
@@ -2044,98 +1985,6 @@ local function GetRecentChatSummaryByName(playerName)
     }
 end
 
-local function LooksLikeGuid(value)
-    if type(value) ~= "string" or value == "" then
-        return false
-    end
-
-    if string.find(value, "^Player%-%d+%-%x+$") then
-        return true
-    end
-
-    if string.find(value, "^0x%x+$") then
-        return true
-    end
-
-    if string.find(value, "^%x+$") and string.len(value) >= 16 and string.find(value, "[%a]") then
-        return true
-    end
-
-    return false
-end
-
-local function ExtractGuidFromEventArgs(...)
-    for i = 1, select("#", ...) do
-        local value = select(i, ...)
-        if LooksLikeGuid(value) then
-            return value
-        end
-    end
-
-    return nil
-end
-
-local function GetSummaryFromGuidApi(playerGuid, nameHint)
-    if type(GetPlayerInfoByGUID) ~= "function" then
-        RecordMethodDiagnostic("guid:GetPlayerInfoByGUID", false, "unavailable", nameHint)
-        return nil
-    end
-
-    local ok, localizedClass, englishClass, localizedRace, _, _, guidName = pcall(GetPlayerInfoByGUID, playerGuid)
-    if not ok then
-        RecordMethodDiagnostic("guid:GetPlayerInfoByGUID", false, "pcall_error", nameHint)
-        return nil
-    end
-
-    if (not localizedClass or localizedClass == "") and type(englishClass) == "string" and englishClass ~= "" then
-        localizedClass = LOCALIZED_CLASS_NAMES_MALE[englishClass]
-            or LOCALIZED_CLASS_NAMES_FEMALE[englishClass]
-            or englishClass
-    end
-
-    local resolvedName = guidName or nameHint
-    if not resolvedName or resolvedName == "" then
-        RecordMethodDiagnostic("guid:GetPlayerInfoByGUID", false, "no_name", nameHint)
-        return nil
-    end
-
-    local summaryData = {
-        name = string.match(resolvedName, "^([^%-]+)") or resolvedName,
-        class = localizedClass,
-        race = localizedRace,
-        faction = InferFactionFromRace(localizedRace),
-        online = true,
-        source = "guid",
-    }
-
-    RecordMethodDiagnostic("guid:GetPlayerInfoByGUID", true, "ok", summaryData.name)
-    return summaryData
-end
-
-local function TrackGuidSummary(nameHint, playerGuid, sourceHint)
-    if not nameHint or nameHint == "" or not LooksLikeGuid(playerGuid) then
-        return nil
-    end
-
-    local guidSummary = GetSummaryFromGuidApi(playerGuid, nameHint)
-    local mergedSummary = MergeSummaryData(guidSummary, nil)
-
-    if not HasAnySummaryInfo(mergedSummary) then
-        return nil
-    end
-
-    if sourceHint and sourceHint ~= "" then
-        if mergedSummary.source and mergedSummary.source ~= "" then
-            mergedSummary.source = mergedSummary.source .. "+" .. sourceHint
-        else
-            mergedSummary.source = sourceHint
-        end
-    end
-
-    StoreCachedSummaryData(nameHint, mergedSummary)
-    return mergedSummary
-end
-
 local function IsOfflineStateReliable(summaryData, pending)
     if not summaryData or summaryData.online ~= false then
         return false
@@ -2484,19 +2333,19 @@ local function HandlePeerLookupRequest(senderName, requestId, targetName)
 
     local responseMessage = BuildPeerLookupResponseMessage(requestId, targetName, responseData)
     PeerDebugPrint(string.format(
-        "sending response for %s to %s requestId=%s %s",
+        "sending response to %s for %s requestId=%s %s",
         senderName,
         targetName or "unknown",
         requestId or "?",
         FormatPeerSummaryDataForDebug(responseData)
     ))
-    local sent, sendError = SendPeerChannelTransportMessage(responseMessage)
+    local sent, sendError = SendWhoDatAddonMessage(responseMessage, "WHISPER", senderName)
     if sent then
         AddDebugEvent(string.format("peer response sent to %s for %s", senderName, targetName))
-        PeerDebugPrint(string.format("response sent for %s requestId=%s", senderName, requestId or "?"))
+        PeerDebugPrint(string.format("response sent to %s requestId=%s", senderName, requestId or "?"))
     else
         AddDebugEvent(string.format("peer response failed to %s for %s (%s)", senderName, targetName, sendError or "unknown"))
-        PeerDebugPrint(string.format("response send failed for %s requestId=%s (%s)", senderName, requestId or "?", sendError or "unknown"))
+        PeerDebugPrint(string.format("response send failed to %s requestId=%s (%s)", senderName, requestId or "?", sendError or "unknown"))
     end
 end
 
@@ -2582,13 +2431,13 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
     local requestId = BuildPeerRequestId()
     local requestMessage = BuildPeerLookupRequestMessage(requestId, pending.requestName)
     PeerDebugPrint(string.format(
-        "requesting lookup via channel from %s for %s requestId=%s targetFaction=%s",
+        "requesting lookup from %s for %s requestId=%s targetFaction=%s",
         peerName,
         pending.requestName,
         requestId,
         targetFaction or "?"
     ))
-    local sent, sendError = SendPeerChannelTransportMessage(requestMessage)
+    local sent, sendError = SendWhoDatAddonMessage(requestMessage, "WHISPER", peerName)
     if not sent then
         AddDebugEvent(string.format(
             "lookup #%d peer request send failed to %s for %s (%s)",
@@ -2598,7 +2447,7 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
             sendError or "unknown"
         ))
         PeerDebugPrint(string.format(
-            "request send failed via channel to %s for %s requestId=%s (%s)",
+            "request send failed to %s for %s requestId=%s (%s)",
             peerName,
             pending.requestName,
             requestId,
@@ -2620,7 +2469,7 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
         targetFaction
     ))
     PeerDebugPrint(string.format(
-        "request sent via channel to %s for %s requestId=%s targetFaction=%s",
+        "request sent to %s for %s requestId=%s targetFaction=%s",
         peerName,
         pending.requestName,
         requestId,
@@ -3128,39 +2977,12 @@ function WhoDat:HandleChatMessageEvent(event, ...)
                     end
                 end
 
-                local transportPayload = ParsePeerChannelTransportMessage(messageText)
-                if transportPayload and senderNormalized and selfNormalized and senderNormalized ~= selfNormalized then
-                    WhoDat.peerAddonConfirmed[senderNormalized] = GetTime()
-
-                    local transportRequestId, transportTargetName = ParsePeerLookupRequestMessage(transportPayload)
-                    if transportRequestId then
-                        HandlePeerLookupRequest(sender, transportRequestId, transportTargetName)
-                    else
-                        local transportResponseRequestId, transportResponseTargetName, transportSummaryData =
-                            ParsePeerLookupResponseMessage(transportPayload)
-                        if transportResponseRequestId then
-                            HandlePeerLookupResponse(sender, transportResponseRequestId, transportResponseTargetName, transportSummaryData)
-                        else
-                            local transportFaction = ParsePeerFactionMessage(transportPayload)
-                            if transportFaction and SetPeerFaction(sender, transportFaction, "channel:transport") then
-                                AddDebugEvent(string.format("peer faction learned from %s via channel transport (%s)", sender, transportFaction))
-                            end
-                        end
-                    end
-                end
             end
         end
     end
 
     TrackChatPresence(sender, source)
 
-    local senderGuid = ExtractGuidFromEventArgs(...)
-    if senderGuid then
-        local guidSummary = TrackGuidSummary(sender, senderGuid, "chat:guid")
-        if guidSummary then
-            DebugPrint(string.format("tracked guid summary for %s", sender))
-        end
-    end
 end
 
 function WhoDat:HandleChannelRosterUpdate(channelId)
@@ -3310,14 +3132,13 @@ function WhoDat:HandleSlashCommand(message)
                 end
             end
             ChatPrint(string.format(
-                "Debug status: %s; filter api: %s; added-pattern: %s; removed-pattern: %s; channel-member-api: %s; channel-roster-api: %s; guid-api: %s; channel-cache: %d; chat-presence: %d; whodat-channel: %s; peer-send: %s; hello: %s; probe: %s; peers-alliance: %d/%d; peers-horde: %d/%d; peers-total: %d.",
+                "Debug status: %s; filter api: %s; added-pattern: %s; removed-pattern: %s; channel-member-api: %s; channel-roster-api: %s; channel-cache: %d; chat-presence: %d; whodat-channel: %s; peer-send: %s; hello: %s; probe: %s; peers-alliance: %d/%d; peers-horde: %d/%d; peers-total: %d.",
                 self.debugEnabled and "on" or "off",
                 ChatFrameAddMessageEventFilter and "available" or "missing",
                 FRIEND_ADDED_PATTERN and "ok" or "missing",
                 FRIEND_REMOVED_PATTERN and "ok" or "missing",
                 type(GetChannelMemberInfo) == "function" and "available" or "missing",
                 type(GetChannelRosterInfo) == "function" and "available" or "missing",
-                type(GetPlayerInfoByGUID) == "function" and "available" or "missing",
                 GetTableCount(self.channelCache),
                 GetTableCount(self.recentChatPresence),
                 channelStatus,
