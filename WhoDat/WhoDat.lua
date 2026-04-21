@@ -14,6 +14,9 @@ WhoDat.peerChannelName = "whodatdata"
 WhoDat.peerChannelMinLevel = 8
 WhoDat.peerChannelJoinRetrySeconds = 10
 WhoDat.peerChannelHelloCooldownSeconds = 30
+WhoDat.peerRosterProbeCooldownSeconds = 30
+WhoDat.peerRosterProbeMaxTargetsPerRun = 12
+WhoDat.peerMemberMaxAgeSeconds = 180
 WhoDat.peerLookupCooldownSeconds = 20
 WhoDat.peerLookupResponseWaitSeconds = 5
 WhoDat.peerFactionMaxPerFaction = 32
@@ -25,6 +28,8 @@ WhoDat.lastChannelScanAt = 0
 WhoDat.lastGuildRosterRefreshAt = 0
 WhoDat.lastPeerChannelJoinAttemptAt = 0
 WhoDat.lastPeerChannelHelloAt = 0
+WhoDat.lastPeerChannelHelloAttemptAt = 0
+WhoDat.lastPeerRosterProbeAt = 0
 WhoDat.peerRequestSequence = 0
 WhoDat.pending = {}
 WhoDat.channelCache = {}
@@ -77,6 +82,7 @@ local ChatFrameAddMessageEventFilter = (ChatFrameUtil and ChatFrameUtil.AddMessa
 local HandleFriendLookupFailureMessage
 local RequestPeerCrossFactionLookup
 local CompleteLookupFromSummary
+local SyncWhodatPeerMembership
 
 local FRIEND_ADD_FAILURE_PATTERNS = {}
 
@@ -1201,7 +1207,7 @@ local function ParseWhodatChannelHelloMessage(message)
         return nil
     end
 
-    local factionText = string.match(message, "^WDHELLO%s+([%a]+)$")
+    local factionText = string.match(message, "^WDHELLO%s+([%a]+)")
     if not factionText then
         return nil
     end
@@ -1220,15 +1226,64 @@ local function SendPeerFactionWhisper(targetName, reason)
         return false
     end
 
-    local sent = SendWhoDatAddonMessage(BuildPeerFactionMessage(myFaction), "WHISPER", targetName)
+    local sent, sendError = SendWhoDatAddonMessage(BuildPeerFactionMessage(myFaction), "WHISPER", targetName)
     if sent then
         AddDebugEvent(string.format("peer faction sent to %s (%s)", targetName, reason or "unknown"))
+    else
+        AddDebugEvent(string.format("peer faction send failed to %s (%s: %s)", targetName, reason or "unknown", sendError or "unknown"))
     end
 
     return sent
 end
 
-local function SendWhodatChannelHello(channelId, forceSend)
+local function SendPeerRosterFactionProbe(forceSend)
+    local now = GetTime()
+    if not forceSend then
+        local lastProbeAt = WhoDat.lastPeerRosterProbeAt or 0
+        if lastProbeAt > 0 and now - lastProbeAt < (WhoDat.peerRosterProbeCooldownSeconds or 30) then
+            return 0
+        end
+    end
+
+    local channelId, channelName = GetWhodatChannelInfo()
+    if channelId then
+        SyncWhodatPeerMembership(channelId, channelName)
+    end
+
+    local selfNormalized = NormalizeName(UnitName("player") or "")
+    local sentCount = 0
+    local failCount = 0
+    local maxTargets = WhoDat.peerRosterProbeMaxTargetsPerRun or 12
+
+    for normalizedName, entry in pairs(WhoDat.peerChannelMembers) do
+        if sentCount >= maxTargets then
+            break
+        end
+
+        if normalizedName ~= selfNormalized and entry and entry.name and entry.name ~= "" then
+            if SendPeerFactionWhisper(entry.name, "roster_probe") then
+                sentCount = sentCount + 1
+            else
+                failCount = failCount + 1
+            end
+        end
+    end
+
+    if sentCount > 0 then
+        WhoDat.lastPeerRosterProbeAt = now
+        AddDebugEvent(string.format("peer roster probe sent=%d failed=%d", sentCount, failCount))
+    else
+        if failCount > 0 then
+            AddDebugEvent(string.format("peer roster probe sent=0 failed=%d", failCount))
+        else
+            AddDebugEvent("peer roster probe found no eligible members")
+        end
+    end
+
+    return sentCount
+end
+
+local function SendWhodatChannelHello(channelId, channelName, forceSend)
     if not CanSendPeerChannelMessages() then
         return false, "level_gated"
     end
@@ -1251,17 +1306,82 @@ local function SendWhodatChannelHello(channelId, forceSend)
     end
 
     local numericChannelId = tonumber(channelId)
-    if not numericChannelId or numericChannelId <= 0 then
+    if (not numericChannelId or numericChannelId <= 0) and (type(channelName) ~= "string" or channelName == "") then
         return false, "invalid_channel"
     end
 
     local helloMessage = string.format("WDHELLO %s", myFaction)
-    local ok = pcall(SendChatMessage, helloMessage, "CHANNEL", nil, numericChannelId)
-    if not ok then
+    local sendTargets = {}
+    local seenTargets = {}
+
+    local function AddSendTarget(value)
+        if value == nil then
+            return
+        end
+
+        local key = tostring(value)
+        if seenTargets[key] then
+            return
+        end
+
+        seenTargets[key] = true
+        table.insert(sendTargets, value)
+    end
+
+    if type(channelName) == "string" and channelName ~= "" then
+        AddSendTarget(channelName)
+    end
+
+    if numericChannelId and numericChannelId > 0 then
+        AddSendTarget(numericChannelId)
+        AddSendTarget(tostring(numericChannelId))
+    end
+
+    local languageTargets = {}
+    local seenLanguages = {}
+
+    local function AddLanguageTarget(value)
+        local key = tostring(value)
+        if seenLanguages[key] then
+            return
+        end
+
+        seenLanguages[key] = true
+        table.insert(languageTargets, value)
+    end
+
+    AddLanguageTarget(nil)
+    AddLanguageTarget("")
+    if type(GetDefaultLanguage) == "function" then
+        local defaultLanguage = GetDefaultLanguage("player")
+        if type(defaultLanguage) == "string" and defaultLanguage ~= "" then
+            AddLanguageTarget(defaultLanguage)
+        end
+    end
+    AddLanguageTarget("Universal")
+
+    local sent = false
+    for _, sendTarget in ipairs(sendTargets) do
+        for _, languageTarget in ipairs(languageTargets) do
+            local ok = pcall(SendChatMessage, helloMessage, "CHANNEL", languageTarget, sendTarget)
+            if ok then
+                sent = true
+                break
+            end
+        end
+
+        if sent then
+            break
+        end
+    end
+
+    if not sent then
         return false, "send_failed"
     end
 
     WhoDat.lastPeerChannelHelloAt = now
+    WhoDat.lastPeerChannelHelloAttemptAt = now
+
     AddDebugEvent(string.format("peer hello sent to %s as %s", WhoDat.peerChannelName, myFaction))
     return true, nil
 end
@@ -1346,18 +1466,46 @@ local function GetChannelMemberInfoSummaryData(channelId, memberIndex)
         return nil
     end
 
+    local previousDisplayChannel = nil
+    local usedSelectedChannel = false
+    if type(SetSelectedDisplayChannel) == "function" then
+        if type(GetSelectedDisplayChannel) == "function" then
+            previousDisplayChannel = GetSelectedDisplayChannel()
+        end
+
+        pcall(SetSelectedDisplayChannel, channelId)
+        usedSelectedChannel = true
+    end
+
     local ok, name, level, class, area, connected = pcall(GetChannelMemberInfo, memberIndex, channelId)
     local usedFallbackOrder = false
+    local usedSingleArg = false
     if (not ok) or type(name) ~= "string" or name == "" then
         usedFallbackOrder = true
         ok, name, level, class, area, connected = pcall(GetChannelMemberInfo, channelId, memberIndex)
     end
 
     if (not ok) or type(name) ~= "string" or name == "" then
+        usedSingleArg = true
+        ok, name, level, class, area, connected = pcall(GetChannelMemberInfo, memberIndex)
+    end
+
+    if usedSelectedChannel and previousDisplayChannel and previousDisplayChannel > 0 then
+        pcall(SetSelectedDisplayChannel, previousDisplayChannel)
+    end
+
+    if (not ok) or type(name) ~= "string" or name == "" then
+        local failureReason = "no_result"
+        if usedSingleArg then
+            failureReason = "no_result_with_selected_channel"
+        elseif usedFallbackOrder then
+            failureReason = "no_result_after_swap"
+        end
+
         RecordMethodDiagnostic(
             "channel:GetChannelMemberInfo",
             false,
-            usedFallbackOrder and "no_result_after_swap" or "no_result"
+            failureReason
         )
         return nil
     end
@@ -1382,10 +1530,17 @@ local function GetChannelMemberInfoSummaryData(channelId, memberIndex)
         online = ParseOnlineFlag(connected),
     }
 
+    local successReason = "ok"
+    if usedSingleArg then
+        successReason = "ok_selected_channel"
+    elseif usedFallbackOrder then
+        successReason = "ok_arg_swap"
+    end
+
     RecordMethodDiagnostic(
         "channel:GetChannelMemberInfo",
         true,
-        usedFallbackOrder and "ok_arg_swap" or "ok",
+        successReason,
         summaryData.name
     )
 
@@ -1398,18 +1553,46 @@ local function GetChannelRosterInfoSummaryData(channelId, memberIndex)
         return nil
     end
 
+    local previousDisplayChannel = nil
+    local usedSelectedChannel = false
+    if type(SetSelectedDisplayChannel) == "function" then
+        if type(GetSelectedDisplayChannel) == "function" then
+            previousDisplayChannel = GetSelectedDisplayChannel()
+        end
+
+        pcall(SetSelectedDisplayChannel, channelId)
+        usedSelectedChannel = true
+    end
+
     local ok, a, b, c, d, e, f, g, h, i = pcall(GetChannelRosterInfo, channelId, memberIndex)
     local usedFallbackOrder = false
+    local usedSingleArg = false
     if (not ok) or type(a) ~= "string" or a == "" then
         usedFallbackOrder = true
         ok, a, b, c, d, e, f, g, h, i = pcall(GetChannelRosterInfo, memberIndex, channelId)
     end
 
     if (not ok) or type(a) ~= "string" or a == "" then
+        usedSingleArg = true
+        ok, a, b, c, d, e, f, g, h, i = pcall(GetChannelRosterInfo, memberIndex)
+    end
+
+    if usedSelectedChannel and previousDisplayChannel and previousDisplayChannel > 0 then
+        pcall(SetSelectedDisplayChannel, previousDisplayChannel)
+    end
+
+    if (not ok) or type(a) ~= "string" or a == "" then
+        local failureReason = "no_result"
+        if usedSingleArg then
+            failureReason = "no_result_with_selected_channel"
+        elseif usedFallbackOrder then
+            failureReason = "no_result_after_swap"
+        end
+
         RecordMethodDiagnostic(
             "channel:GetChannelRosterInfo",
             false,
-            usedFallbackOrder and "no_result_after_swap" or "no_result"
+            failureReason
         )
         return nil
     end
@@ -1440,10 +1623,17 @@ local function GetChannelRosterInfoSummaryData(channelId, memberIndex)
         end
     end
 
+    local successReason = "ok"
+    if usedSingleArg then
+        successReason = "ok_selected_channel"
+    elseif usedFallbackOrder then
+        successReason = "ok_arg_swap"
+    end
+
     RecordMethodDiagnostic(
         "channel:GetChannelRosterInfo",
         true,
-        usedFallbackOrder and "ok_arg_swap" or "ok",
+        successReason,
         summaryData.name
     )
 
@@ -1490,7 +1680,7 @@ local function GetChannelProbeLimit(channelId)
     return memberCount
 end
 
-local function SyncWhodatPeerMembership(channelId, channelName)
+SyncWhodatPeerMembership = function(channelId, channelName)
     if not IsWhodatChannelName(channelName) then
         return
     end
@@ -1500,6 +1690,11 @@ local function SyncWhodatPeerMembership(channelId, channelName)
         return
     end
 
+    if type(ChannelRoster) == "function" then
+        pcall(ChannelRoster, numericChannelId)
+    end
+
+    local now = GetTime()
     local seenMembers = {}
     local probeLimit = GetChannelProbeLimit(numericChannelId)
     local missCount = 0
@@ -1522,8 +1717,24 @@ local function SyncWhodatPeerMembership(channelId, channelName)
         end
     end
 
-    for normalizedName in pairs(WhoDat.peerChannelMembers) do
-        if not seenMembers[normalizedName] then
+    -- Some cores return sparse/incomplete roster snapshots; use fresh channel cache entries as fallback member source.
+    local cacheMaxAge = WhoDat.channelCacheMaxAgeSeconds or 900
+    for normalizedName, cachedData in pairs(WhoDat.channelCache) do
+        if cachedData and now - (cachedData.observedAt or 0) <= cacheMaxAge then
+            local source = cachedData.source or ""
+            local sourceChannel = string.match(source, "^channel:(.+)$")
+            if sourceChannel and IsWhodatChannelName(sourceChannel) then
+                local memberName = cachedData.name or normalizedName
+                TrackPeerChannelMember(memberName)
+                seenMembers[normalizedName] = true
+            end
+        end
+    end
+
+    local maxMemberAge = WhoDat.peerMemberMaxAgeSeconds or 180
+    for normalizedName, entry in pairs(WhoDat.peerChannelMembers) do
+        local seenAt = entry and entry.seenAt or 0
+        if now - seenAt > maxMemberAge then
             WhoDat.peerChannelMembers[normalizedName] = nil
             WhoDat.peerFactionCache[normalizedName] = nil
         end
@@ -2378,7 +2589,7 @@ local function StartLookup(playerName)
     local channelId, channelName = EnsureWhodatChannelJoined(false)
     if channelId then
         SyncWhodatPeerMembership(channelId, channelName)
-        SendWhodatChannelHello(channelId, false)
+        SendWhodatChannelHello(channelId, channelName, false)
     end
 
     local existingFriendIndex = GetFriendIndexByName(playerName)
@@ -2573,8 +2784,13 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
 
     local faction = ParsePeerFactionMessage(message)
     if faction then
+        local normalizedSender = NormalizeName(sender)
+        local wasKnown = normalizedSender and WhoDat.peerFactionCache[normalizedSender] ~= nil
         if SetPeerFaction(sender, faction, "addon:faction") then
             AddDebugEvent(string.format("peer faction learned from %s (%s)", sender, faction))
+            if not wasKnown then
+                SendPeerFactionWhisper(sender, "faction_ack")
+            end
         end
         return
     end
@@ -2613,10 +2829,17 @@ function WhoDat:HandleChatMessageEvent(event, ...)
 
                 local helloFaction = ParseWhodatChannelHelloMessage(messageText)
                 if helloFaction then
-                    if SetPeerFaction(sender, helloFaction, "channel:hello") then
-                        AddDebugEvent(string.format("peer hello from %s (%s)", sender, helloFaction))
+                    local senderNormalized = NormalizeName(sender)
+                    local selfNormalized = NormalizeName(UnitName("player") or "")
+                    if senderNormalized and selfNormalized and senderNormalized == selfNormalized then
+                        WhoDat.lastPeerChannelHelloAt = GetTime()
+                        AddDebugEvent(string.format("peer hello echo confirmed (%s)", helloFaction))
+                    else
+                        if SetPeerFaction(sender, helloFaction, "channel:hello") then
+                            AddDebugEvent(string.format("peer hello from %s (%s)", sender, helloFaction))
+                        end
+                        SendPeerFactionWhisper(sender, "hello_seen")
                     end
-                    SendPeerFactionWhisper(sender, "hello_seen")
                 end
             end
         end
@@ -2654,7 +2877,39 @@ function WhoDat:HandleChannelRosterUpdate(channelId)
 
     if IsWhodatChannelName(channelName) then
         SyncWhodatPeerMembership(numericChannelId, channelName)
-        SendWhodatChannelHello(numericChannelId, false)
+        SendWhodatChannelHello(numericChannelId, channelName, false)
+    end
+end
+
+function WhoDat:HandleChannelSystemEvent(event, ...)
+    local shouldRefresh = false
+    local forceHello = false
+
+    if event == "CHANNEL_UI_UPDATE" then
+        shouldRefresh = true
+    elseif event == "CHAT_MSG_CHANNEL_NOTICE" then
+        for i = 1, select("#", ...) do
+            local value = select(i, ...)
+            if type(value) == "string" and IsWhodatChannelName(value) then
+                shouldRefresh = true
+                break
+            end
+        end
+
+        local noticeType = select(1, ...)
+        if type(noticeType) == "string" and string.find(noticeType, "JOIN", 1, true) then
+            forceHello = true
+        end
+    end
+
+    if not shouldRefresh then
+        return
+    end
+
+    local channelId, channelName = EnsureWhodatChannelJoined(false)
+    if channelId then
+        SyncWhodatPeerMembership(channelId, channelName)
+        SendWhodatChannelHello(channelId, channelName, forceHello)
     end
 end
 
@@ -2662,11 +2917,30 @@ function WhoDat:HandleSlashCommand(message)
     local playerName = ParseSlashName(message)
     if not playerName then
         ChatPrint("Usage: /whodat PlayerName")
+        ChatPrint("       /whodat hello")
         ChatPrint("       /whodat debug on|off|status|log|reset")
         return
     end
 
-    if NormalizeName(playerName) == "debug" then
+    local normalizedArg = NormalizeName(playerName)
+    if normalizedArg == "hello" then
+        local channelId, channelName = EnsureWhodatChannelJoined(true)
+        if not channelId then
+            ChatPrint(string.format("Could not find or join %s.", WhoDat.peerChannelName))
+            return
+        end
+
+        SyncWhodatPeerMembership(channelId, channelName)
+        local sent, reason = SendWhodatChannelHello(channelId, channelName, true)
+        if sent then
+            ChatPrint(string.format("Sent visible hello to %s.", channelName or WhoDat.peerChannelName))
+        else
+            ChatPrint(string.format("Could not send hello to %s (%s).", channelName or WhoDat.peerChannelName, reason or "unknown"))
+        end
+        return
+    end
+
+    if normalizedArg == "debug" then
         local debugArg = string.match(message or "", "^%s*%S+%s+(%S+)")
         debugArg = NormalizeName(debugArg)
 
@@ -2684,8 +2958,32 @@ function WhoDat:HandleSlashCommand(message)
         else
             local alliancePeerCount, hordePeerCount = GetPeerFactionCacheCounts()
             local peerTotalCount = alliancePeerCount + hordePeerCount
+            local whodatChannelId = select(1, GetWhodatChannelInfo())
+            local channelStatus = whodatChannelId and "joined" or "missing"
+            local playerLevel = type(UnitLevel) == "function" and (UnitLevel("player") or 0) or 0
+            local sendStatus = CanSendPeerChannelMessages() and "allowed" or string.format("locked(<8):%d", playerLevel)
+            local helloStatus = "never"
+            local lastHelloAt = self.lastPeerChannelHelloAt or 0
+            if lastHelloAt > 0 then
+                local ageSeconds = math.floor(GetTime() - lastHelloAt)
+                if ageSeconds < 0 then
+                    ageSeconds = 0
+                end
+                helloStatus = string.format("%ds ago", ageSeconds)
+            end
+            local probeStatus = "idle"
+            local lastProbeAt = self.lastPeerRosterProbeAt or 0
+            if lastProbeAt > 0 then
+                local probeCooldown = self.peerRosterProbeCooldownSeconds or 30
+                local probeRemaining = math.ceil((lastProbeAt + probeCooldown) - GetTime())
+                if probeRemaining > 0 then
+                    probeStatus = string.format("cooldown:%ds", probeRemaining)
+                else
+                    probeStatus = "ready"
+                end
+            end
             ChatPrint(string.format(
-                "Debug status: %s; filter api: %s; added-pattern: %s; removed-pattern: %s; channel-member-api: %s; channel-roster-api: %s; guid-api: %s; channel-cache: %d; chat-presence: %d; peers-alliance: %d/%d; peers-horde: %d/%d; peers-total: %d.",
+                "Debug status: %s; filter api: %s; added-pattern: %s; removed-pattern: %s; channel-member-api: %s; channel-roster-api: %s; guid-api: %s; channel-cache: %d; chat-presence: %d; whodat-channel: %s; peer-send: %s; hello: %s; probe: %s; peers-alliance: %d/%d; peers-horde: %d/%d; peers-total: %d.",
                 self.debugEnabled and "on" or "off",
                 ChatFrameAddMessageEventFilter and "available" or "missing",
                 FRIEND_ADDED_PATTERN and "ok" or "missing",
@@ -2695,6 +2993,10 @@ function WhoDat:HandleSlashCommand(message)
                 type(GetPlayerInfoByGUID) == "function" and "available" or "missing",
                 GetTableCount(self.channelCache),
                 GetTableCount(self.recentChatPresence),
+                channelStatus,
+                sendStatus,
+                helloStatus,
+                probeStatus,
                 alliancePeerCount,
                 self.peerFactionMaxPerFaction or 32,
                 hordePeerCount,
@@ -2714,6 +3016,8 @@ function WhoDat:HandlePlayerLogin()
     self.channelCache = WhoDatDB.channelCache
     self.peerChannelMembers = {}
     self.peerFactionCache = {}
+    self.lastPeerChannelHelloAttemptAt = 0
+    self.lastPeerRosterProbeAt = 0
     self.lastPeerLookupAt = {}
     ResetDebugTracking()
 
@@ -2722,7 +3026,7 @@ function WhoDat:HandlePlayerLogin()
     local channelId, channelName = EnsureWhodatChannelJoined(true)
     if channelId then
         SyncWhodatPeerMembership(channelId, channelName)
-        SendWhodatChannelHello(channelId, true)
+        SendWhodatChannelHello(channelId, channelName, true)
     end
 
     if ChatFrameAddMessageEventFilter then
@@ -2759,6 +3063,8 @@ WhoDat:SetScript("OnEvent", function(self, event, ...)
         self:HandlePlayerLogin()
     elseif event == "FRIENDLIST_UPDATE" then
         self:HandleFriendListUpdate()
+    elseif event == "CHANNEL_UI_UPDATE" or event == "CHAT_MSG_CHANNEL_NOTICE" then
+        self:HandleChannelSystemEvent(event, ...)
     elseif event == "CHAT_MSG_ADDON" then
         self:HandleAddonMessageEvent(...)
     elseif event == "CHANNEL_ROSTER_UPDATE" then
@@ -2770,6 +3076,8 @@ end)
 
 WhoDat:RegisterEvent("PLAYER_LOGIN")
 WhoDat:RegisterEvent("FRIENDLIST_UPDATE")
+WhoDat:RegisterEvent("CHANNEL_UI_UPDATE")
+WhoDat:RegisterEvent("CHAT_MSG_CHANNEL_NOTICE")
 WhoDat:RegisterEvent("CHAT_MSG_ADDON")
 WhoDat:RegisterEvent("CHANNEL_ROSTER_UPDATE")
 WhoDat:RegisterEvent("CHAT_MSG_CHANNEL")
