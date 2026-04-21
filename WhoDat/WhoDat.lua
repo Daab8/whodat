@@ -2916,6 +2916,12 @@ function WhoDat:OnUpdate(elapsed)
                         pending.requestName,
                         peerLookupReason or "unknown"
                     ))
+                    PeerDebugPrint(string.format(
+                        "request skipped for %s lookupId=%s (%s)",
+                        pending.requestName,
+                        tostring(pending.lookupId or "?"),
+                        peerLookupReason or "unknown"
+                    ))
                 end
             end
         end
@@ -3004,12 +3010,8 @@ function WhoDat:HandleAddonMessageEvent(prefix, message, distribution, sender)
 
     local faction = ParsePeerFactionMessage(message)
     if faction then
-        local wasKnown = normalizedSender and WhoDat.peerFactionCache[normalizedSender] ~= nil
         if SetPeerFaction(sender, faction, "addon:faction") then
             AddDebugEvent(string.format("peer faction learned from %s (%s)", sender, faction))
-            if not wasKnown then
-                SendPeerFactionWhisper(sender, "faction_ack")
-            end
         end
         return
     end
@@ -3058,10 +3060,12 @@ function WhoDat:HandleChatMessageEvent(event, ...)
                         WhoDat.peerStartupHelloDeadlineAt = 0
                         AddDebugEvent(string.format("peer hello echo confirmed (%s)", helloFaction))
                     else
+                        if senderNormalized then
+                            WhoDat.peerAddonConfirmed[senderNormalized] = GetTime()
+                        end
                         if SetPeerFaction(sender, helloFaction, "channel:hello") then
                             AddDebugEvent(string.format("peer hello from %s (%s)", sender, helloFaction))
                         end
-                        SendPeerFactionWhisper(sender, "hello_seen")
                     end
                 end
             end
