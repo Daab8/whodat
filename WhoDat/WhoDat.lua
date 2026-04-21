@@ -1327,6 +1327,64 @@ local function ParseWhodatChannelHelloMessage(message)
     return NormalizeFaction(factionText)
 end
 
+local function BuildPeerChannelTransportMessage(payload)
+    if type(payload) ~= "string" or payload == "" then
+        return nil
+    end
+
+    return "WDX " .. payload
+end
+
+local function ParsePeerChannelTransportMessage(message)
+    if type(message) ~= "string" then
+        return nil
+    end
+
+    local payload = string.match(message, "^WDX%s+(.*)$")
+    if not payload or payload == "" then
+        return nil
+    end
+
+    return payload
+end
+
+local function SendPeerChannelTransportMessage(payload)
+    if not CanSendPeerChannelMessages() then
+        return false, "channel_level_gated"
+    end
+
+    if type(SendChatMessage) ~= "function" then
+        return false, "unavailable"
+    end
+
+    local transportMessage = BuildPeerChannelTransportMessage(payload)
+    if not transportMessage then
+        return false, "invalid_payload"
+    end
+
+    local channelId, channelName = EnsureWhodatChannelJoined(false)
+    local numericChannelId = tonumber(channelId)
+    if (not numericChannelId or numericChannelId <= 0) and (type(channelName) ~= "string" or channelName == "") then
+        return false, "no_channel"
+    end
+
+    local sendTarget = numericChannelId and numericChannelId > 0 and numericChannelId or channelName
+    local languageTarget = nil
+    if type(GetDefaultLanguage) == "function" then
+        local defaultLanguage = GetDefaultLanguage("player")
+        if type(defaultLanguage) == "string" and defaultLanguage ~= "" then
+            languageTarget = defaultLanguage
+        end
+    end
+
+    local ok, sendError = pcall(SendChatMessage, transportMessage, "CHANNEL", languageTarget, sendTarget)
+    if not ok then
+        return false, tostring(sendError)
+    end
+
+    return true, nil
+end
+
 local function SendPeerFactionWhisper(targetName, reason)
     local myFaction = GetPlayerFaction()
     if not myFaction or type(targetName) ~= "string" or targetName == "" then
@@ -2426,19 +2484,19 @@ local function HandlePeerLookupRequest(senderName, requestId, targetName)
 
     local responseMessage = BuildPeerLookupResponseMessage(requestId, targetName, responseData)
     PeerDebugPrint(string.format(
-        "sending response to %s for %s requestId=%s %s",
+        "sending response for %s to %s requestId=%s %s",
         senderName,
         targetName or "unknown",
         requestId or "?",
         FormatPeerSummaryDataForDebug(responseData)
     ))
-    local sent, sendError = SendWhoDatAddonMessage(responseMessage, "WHISPER", senderName)
+    local sent, sendError = SendPeerChannelTransportMessage(responseMessage)
     if sent then
         AddDebugEvent(string.format("peer response sent to %s for %s", senderName, targetName))
-        PeerDebugPrint(string.format("response sent to %s requestId=%s", senderName, requestId or "?"))
+        PeerDebugPrint(string.format("response sent for %s requestId=%s", senderName, requestId or "?"))
     else
         AddDebugEvent(string.format("peer response failed to %s for %s (%s)", senderName, targetName, sendError or "unknown"))
-        PeerDebugPrint(string.format("response send failed to %s requestId=%s (%s)", senderName, requestId or "?", sendError or "unknown"))
+        PeerDebugPrint(string.format("response send failed for %s requestId=%s (%s)", senderName, requestId or "?", sendError or "unknown"))
     end
 end
 
@@ -2524,13 +2582,13 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
     local requestId = BuildPeerRequestId()
     local requestMessage = BuildPeerLookupRequestMessage(requestId, pending.requestName)
     PeerDebugPrint(string.format(
-        "requesting lookup from %s for %s requestId=%s targetFaction=%s",
+        "requesting lookup via channel from %s for %s requestId=%s targetFaction=%s",
         peerName,
         pending.requestName,
         requestId,
         targetFaction or "?"
     ))
-    local sent, sendError = SendWhoDatAddonMessage(requestMessage, "WHISPER", peerName)
+    local sent, sendError = SendPeerChannelTransportMessage(requestMessage)
     if not sent then
         AddDebugEvent(string.format(
             "lookup #%d peer request send failed to %s for %s (%s)",
@@ -2540,7 +2598,7 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
             sendError or "unknown"
         ))
         PeerDebugPrint(string.format(
-            "request send failed to %s for %s requestId=%s (%s)",
+            "request send failed via channel to %s for %s requestId=%s (%s)",
             peerName,
             pending.requestName,
             requestId,
@@ -2562,7 +2620,7 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
         targetFaction
     ))
     PeerDebugPrint(string.format(
-        "request sent to %s for %s requestId=%s targetFaction=%s",
+        "request sent via channel to %s for %s requestId=%s targetFaction=%s",
         peerName,
         pending.requestName,
         requestId,
@@ -3048,10 +3106,11 @@ function WhoDat:HandleChatMessageEvent(event, ...)
             if IsWhodatChannelName(channelName) then
                 TrackPeerChannelMember(sender)
 
+                local senderNormalized = NormalizeName(sender)
+                local selfNormalized = NormalizeName(UnitName("player") or "")
+
                 local helloFaction = ParseWhodatChannelHelloMessage(messageText)
                 if helloFaction then
-                    local senderNormalized = NormalizeName(sender)
-                    local selfNormalized = NormalizeName(UnitName("player") or "")
                     if senderNormalized and selfNormalized and senderNormalized == selfNormalized then
                         local echoAt = GetTime()
                         WhoDat.lastPeerChannelHelloAt = echoAt
@@ -3065,6 +3124,27 @@ function WhoDat:HandleChatMessageEvent(event, ...)
                         end
                         if SetPeerFaction(sender, helloFaction, "channel:hello") then
                             AddDebugEvent(string.format("peer hello from %s (%s)", sender, helloFaction))
+                        end
+                    end
+                end
+
+                local transportPayload = ParsePeerChannelTransportMessage(messageText)
+                if transportPayload and senderNormalized and selfNormalized and senderNormalized ~= selfNormalized then
+                    WhoDat.peerAddonConfirmed[senderNormalized] = GetTime()
+
+                    local transportRequestId, transportTargetName = ParsePeerLookupRequestMessage(transportPayload)
+                    if transportRequestId then
+                        HandlePeerLookupRequest(sender, transportRequestId, transportTargetName)
+                    else
+                        local transportResponseRequestId, transportResponseTargetName, transportSummaryData =
+                            ParsePeerLookupResponseMessage(transportPayload)
+                        if transportResponseRequestId then
+                            HandlePeerLookupResponse(sender, transportResponseRequestId, transportResponseTargetName, transportSummaryData)
+                        else
+                            local transportFaction = ParsePeerFactionMessage(transportPayload)
+                            if transportFaction and SetPeerFaction(sender, transportFaction, "channel:transport") then
+                                AddDebugEvent(string.format("peer faction learned from %s via channel transport (%s)", sender, transportFaction))
+                            end
                         end
                     end
                 end
