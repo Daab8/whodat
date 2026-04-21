@@ -2312,8 +2312,11 @@ local function HandlePeerLookupRequest(senderName, requestId, targetName)
         return
     end
 
+    AddDebugEvent(string.format("peer request received from %s for %s", senderName, targetName or "unknown"))
+
     local responseData = BuildPeerLookupSummaryByName(targetName)
     if not responseData then
+        AddDebugEvent(string.format("peer response skipped to %s for %s (no local data)", senderName, targetName or "unknown"))
         return
     end
 
@@ -2340,6 +2343,8 @@ local function HandlePeerLookupResponse(senderName, requestId, targetName, summa
     if pending.peerRequestId ~= requestId then
         return
     end
+
+    AddDebugEvent(string.format("peer response received from %s for %s", senderName, targetName))
 
     pending.peerResponderName = senderName
 
@@ -2389,7 +2394,6 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
     local channelId, channelName = EnsureWhodatChannelJoined(false)
     if channelId then
         SyncWhodatPeerMembership(channelId, channelName)
-        SendWhodatChannelHello(channelId, channelName, false)
     end
 
     local peerName = ChooseRandomPeerByFaction(targetFaction)
@@ -2949,7 +2953,6 @@ function WhoDat:HandleChannelRosterUpdate(channelId)
 
     if IsWhodatChannelName(channelName) then
         SyncWhodatPeerMembership(numericChannelId, channelName)
-        SendWhodatChannelHello(numericChannelId, channelName, false)
     end
 end
 
@@ -2976,7 +2979,6 @@ function WhoDat:HandleChannelSystemEvent(event, ...)
     local channelId, channelName = EnsureWhodatChannelJoined(false)
     if channelId then
         SyncWhodatPeerMembership(channelId, channelName)
-        SendWhodatChannelHello(channelId, channelName, false)
     end
 end
 
