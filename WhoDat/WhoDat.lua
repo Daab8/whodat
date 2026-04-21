@@ -423,6 +423,52 @@ local function DebugPrint(message)
     end
 end
 
+local function FormatPeerSummaryDataForDebug(summaryData)
+    if type(summaryData) ~= "table" then
+        return "data=none"
+    end
+
+    local function ToText(value)
+        if value == nil then
+            return "?"
+        end
+
+        local text = tostring(value)
+        if text == "" then
+            return "?"
+        end
+
+        return text
+    end
+
+    local onlineText = "?"
+    if summaryData.online == true then
+        onlineText = "1"
+    elseif summaryData.online == false then
+        onlineText = "0"
+    end
+
+    return string.format(
+        "name=%s level=%s class=%s area=%s online=%s faction=%s race=%s source=%s",
+        ToText(summaryData.name),
+        ToText(summaryData.level),
+        ToText(summaryData.class),
+        ToText(summaryData.area),
+        onlineText,
+        ToText(summaryData.faction),
+        ToText(summaryData.race),
+        ToText(summaryData.source)
+    )
+end
+
+local function PeerDebugPrint(message)
+    if not WhoDat.debugEnabled then
+        return
+    end
+
+    ChatPrint("peer-debug: " .. tostring(message or ""))
+end
+
 local function QueueFriendSystemMessageSuppression(name, action)
     local normalizedName = NormalizeName(name)
     if not normalizedName then
@@ -1116,6 +1162,30 @@ local function ChooseRandomPeerByFaction(faction)
             candidateCount = candidateCount + 1
             if math.random(candidateCount) == 1 then
                 selectedName = entry.name
+            end
+        end
+    end
+
+    return selectedName
+end
+
+local function ChooseRandomUnknownFactionPeer()
+    local selfNormalized = NormalizeName(UnitName("player") or "")
+    local selectedName = nil
+    local candidateCount = 0
+    local minWhisperLevel = WhoDat.peerWhisperMinLevel or 9
+
+    for normalizedName, memberEntry in pairs(WhoDat.peerChannelMembers) do
+        if normalizedName ~= selfNormalized and memberEntry and memberEntry.name and memberEntry.name ~= "" then
+            local knownFactionEntry = WhoDat.peerFactionCache[normalizedName]
+            if not knownFactionEntry then
+                local knownLevel = GetKnownPeerChannelMemberLevel(memberEntry.name)
+                if (not knownLevel) or knownLevel >= minWhisperLevel then
+                    candidateCount = candidateCount + 1
+                    if math.random(candidateCount) == 1 then
+                        selectedName = memberEntry.name
+                    end
+                end
             end
         end
     end
@@ -2313,19 +2383,40 @@ local function HandlePeerLookupRequest(senderName, requestId, targetName)
     end
 
     AddDebugEvent(string.format("peer request received from %s for %s", senderName, targetName or "unknown"))
+    PeerDebugPrint(string.format(
+        "request received from %s for %s requestId=%s",
+        senderName,
+        targetName or "unknown",
+        requestId or "?"
+    ))
 
     local responseData = BuildPeerLookupSummaryByName(targetName)
     if not responseData then
         AddDebugEvent(string.format("peer response skipped to %s for %s (no local data)", senderName, targetName or "unknown"))
+        PeerDebugPrint(string.format(
+            "response skipped to %s for %s requestId=%s (no local data)",
+            senderName,
+            targetName or "unknown",
+            requestId or "?"
+        ))
         return
     end
 
     local responseMessage = BuildPeerLookupResponseMessage(requestId, targetName, responseData)
+    PeerDebugPrint(string.format(
+        "sending response to %s for %s requestId=%s %s",
+        senderName,
+        targetName or "unknown",
+        requestId or "?",
+        FormatPeerSummaryDataForDebug(responseData)
+    ))
     local sent, sendError = SendWhoDatAddonMessage(responseMessage, "WHISPER", senderName)
     if sent then
         AddDebugEvent(string.format("peer response sent to %s for %s", senderName, targetName))
+        PeerDebugPrint(string.format("response sent to %s requestId=%s", senderName, requestId or "?"))
     else
         AddDebugEvent(string.format("peer response failed to %s for %s (%s)", senderName, targetName, sendError or "unknown"))
+        PeerDebugPrint(string.format("response send failed to %s requestId=%s (%s)", senderName, requestId or "?", sendError or "unknown"))
     end
 end
 
@@ -2345,6 +2436,13 @@ local function HandlePeerLookupResponse(senderName, requestId, targetName, summa
     end
 
     AddDebugEvent(string.format("peer response received from %s for %s", senderName, targetName))
+    PeerDebugPrint(string.format(
+        "response received from %s for %s requestId=%s %s",
+        senderName,
+        targetName,
+        requestId or "?",
+        FormatPeerSummaryDataForDebug(summaryData)
+    ))
 
     pending.peerResponderName = senderName
 
@@ -2398,11 +2496,28 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
 
     local peerName = ChooseRandomPeerByFaction(targetFaction)
     if not peerName then
-        return false, "no_peer_data"
+        peerName = ChooseRandomUnknownFactionPeer()
+        if not peerName then
+            return false, "no_peer_data"
+        end
+
+        AddDebugEvent(string.format(
+            "lookup #%d using unknown-faction peer %s for %s",
+            pending.lookupId or 0,
+            peerName,
+            pending.requestName
+        ))
     end
 
     local requestId = BuildPeerRequestId()
     local requestMessage = BuildPeerLookupRequestMessage(requestId, pending.requestName)
+    PeerDebugPrint(string.format(
+        "requesting lookup from %s for %s requestId=%s targetFaction=%s",
+        peerName,
+        pending.requestName,
+        requestId,
+        targetFaction or "?"
+    ))
     local sent, sendError = SendWhoDatAddonMessage(requestMessage, "WHISPER", peerName)
     if not sent then
         AddDebugEvent(string.format(
@@ -2410,6 +2525,13 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
             pending.lookupId or 0,
             peerName,
             pending.requestName,
+            sendError or "unknown"
+        ))
+        PeerDebugPrint(string.format(
+            "request send failed to %s for %s requestId=%s (%s)",
+            peerName,
+            pending.requestName,
+            requestId,
             sendError or "unknown"
         ))
         return false, "send_failed"
@@ -2426,6 +2548,13 @@ RequestPeerCrossFactionLookup = function(normalizedName, pending, fallbackData)
         peerName,
         pending.requestName,
         targetFaction
+    ))
+    PeerDebugPrint(string.format(
+        "request sent to %s for %s requestId=%s targetFaction=%s",
+        peerName,
+        pending.requestName,
+        requestId,
+        targetFaction or "?"
     ))
 
     return true, nil
