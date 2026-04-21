@@ -2565,7 +2565,6 @@ local function StartLookup(playerName)
     if channelId then
         SyncWhodatPeerMembership(channelId, channelName)
         SendWhodatChannelHello(channelId, channelName, false)
-        SendPeerRosterFactionProbe(false)
     end
 
     local existingFriendIndex = GetFriendIndexByName(playerName)
@@ -2856,7 +2855,6 @@ function WhoDat:HandleChannelRosterUpdate(channelId)
     if IsWhodatChannelName(channelName) then
         SyncWhodatPeerMembership(numericChannelId, channelName)
         SendWhodatChannelHello(numericChannelId, channelName, false)
-        SendPeerRosterFactionProbe(false)
     end
 end
 
@@ -2884,7 +2882,6 @@ function WhoDat:HandleChannelSystemEvent(event, ...)
     if channelId then
         SyncWhodatPeerMembership(channelId, channelName)
         SendWhodatChannelHello(channelId, channelName, false)
-        SendPeerRosterFactionProbe(false)
     end
 end
 
@@ -2907,7 +2904,6 @@ function WhoDat:HandleSlashCommand(message)
 
         SyncWhodatPeerMembership(channelId, channelName)
         local sent, reason = SendWhodatChannelHello(channelId, channelName, true)
-        SendPeerRosterFactionProbe(true)
         if sent then
             local myFaction = GetPlayerFaction() or "Unknown"
             ChatPrint(string.format("Hello attempt sent to %s.", channelName or WhoDat.peerChannelName))
@@ -3012,7 +3008,6 @@ function WhoDat:HandlePlayerLogin()
     if channelId then
         SyncWhodatPeerMembership(channelId, channelName)
         SendWhodatChannelHello(channelId, channelName, false)
-        SendPeerRosterFactionProbe(false)
     end
 
     if ChatFrameAddMessageEventFilter then
