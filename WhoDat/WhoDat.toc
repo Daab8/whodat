@@ -1,0 +1,8 @@
+## Interface: 30300
+## Title: WhoDat
+## Notes: Shift-click player names or use /whodat Name to print level/class/location.
+## Author: GitHub Copilot
+## Version: 1.4.6
+## SavedVariables: WhoDatDB
+
+WhoDat.lua
