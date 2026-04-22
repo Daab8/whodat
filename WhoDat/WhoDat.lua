@@ -27,6 +27,8 @@ WhoDat.addonCommPrefix = "WHODATX1"
 WhoDat.guildRosterRefreshIntervalSeconds = 10
 WhoDat.debugEnabled = false
 WhoDat.debugLogMaxEvents = 50
+WhoDat.persistDebugToSavedVariables = true
+WhoDat.persistentDebugLogMaxEvents = 500
 WhoDat.lastChannelScanAt = 0
 WhoDat.lastGuildRosterRefreshAt = 0
 WhoDat.lastPeerChannelJoinAttemptAt = 0
@@ -48,6 +50,7 @@ WhoDat.lastPeerLookupAt = {}
 WhoDat.methodStats = {}
 WhoDat.methodStatsStartedAt = 0
 WhoDat.debugEvents = {}
+WhoDat.persistentDebugEvents = {}
 WhoDat.debugSummary = {}
 WhoDat.lookupSequence = 0
 WhoDat.scanInterval = 0.2
@@ -253,6 +256,18 @@ local function AddDebugEvent(message)
     local entry = string.format("[%s] %s", date("%H:%M:%S"), message)
     table.insert(WhoDat.debugEvents, entry)
 
+    if WhoDat.persistDebugToSavedVariables then
+        if type(WhoDat.persistentDebugEvents) ~= "table" then
+            WhoDat.persistentDebugEvents = {}
+        end
+
+        table.insert(WhoDat.persistentDebugEvents, entry)
+        local persistentMax = WhoDat.persistentDebugLogMaxEvents or 500
+        while #WhoDat.persistentDebugEvents > persistentMax do
+            table.remove(WhoDat.persistentDebugEvents, 1)
+        end
+    end
+
     while #WhoDat.debugEvents > WhoDat.debugLogMaxEvents do
         table.remove(WhoDat.debugEvents, 1)
     end
@@ -420,6 +435,36 @@ local function PrintDebugLog()
             ChatPrint(WhoDat.debugEvents[i])
         end
     end
+end
+
+local function PrintPersistentDebugLog()
+    if type(WhoDat.persistentDebugEvents) ~= "table" or #WhoDat.persistentDebugEvents == 0 then
+        ChatPrint("persistent-debug-log: empty.")
+        return
+    end
+
+    ChatPrint(string.format(
+        "persistent-debug-log: entries=%d (written to SavedVariables on logout/reload).",
+        #WhoDat.persistentDebugEvents
+    ))
+
+    local startIndex = #WhoDat.persistentDebugEvents - 29
+    if startIndex < 1 then
+        startIndex = 1
+    end
+
+    for i = startIndex, #WhoDat.persistentDebugEvents do
+        ChatPrint(WhoDat.persistentDebugEvents[i])
+    end
+end
+
+local function ClearPersistentDebugLog()
+    WhoDat.persistentDebugEvents = {}
+    if type(WhoDatDB) == "table" then
+        WhoDatDB.persistentDebugEvents = WhoDat.persistentDebugEvents
+    end
+
+    ChatPrint("Persistent debug log cleared.")
 end
 
 local function DebugPrint(message)
@@ -3042,7 +3087,7 @@ function WhoDat:HandleSlashCommand(message)
     if not playerName then
         ChatPrint("Usage: /whodat PlayerName")
         ChatPrint("       /whodat hello")
-        ChatPrint("       /whodat debug on|off|status|log|reset")
+        ChatPrint("       /whodat debug on|off|status|log|savedlog|clearlog|reset")
         return
     end
 
@@ -3080,12 +3125,17 @@ function WhoDat:HandleSlashCommand(message)
             ChatPrint("Debug mode disabled.")
         elseif debugArg == "log" then
             PrintDebugLog()
+        elseif debugArg == "savedlog" then
+            PrintPersistentDebugLog()
+        elseif debugArg == "clearlog" then
+            ClearPersistentDebugLog()
         elseif debugArg == "reset" then
             ResetDebugTracking()
             ChatPrint("Debug log counters reset.")
         else
             local alliancePeerCount, hordePeerCount = GetPeerFactionCacheCounts()
             local peerTotalCount = alliancePeerCount + hordePeerCount
+            local persistentLogCount = type(self.persistentDebugEvents) == "table" and #self.persistentDebugEvents or 0
             local whodatChannelId = select(1, GetWhodatChannelInfo())
             local channelStatus = whodatChannelId and "joined" or "missing"
             local playerLevel = type(UnitLevel) == "function" and (UnitLevel("player") or 0) or 0
@@ -3132,7 +3182,7 @@ function WhoDat:HandleSlashCommand(message)
                 end
             end
             ChatPrint(string.format(
-                "Debug status: %s; filter api: %s; added-pattern: %s; removed-pattern: %s; channel-member-api: %s; channel-roster-api: %s; channel-cache: %d; chat-presence: %d; whodat-channel: %s; peer-send: %s; hello: %s; probe: %s; peers-alliance: %d/%d; peers-horde: %d/%d; peers-total: %d.",
+                "Debug status: %s; filter api: %s; added-pattern: %s; removed-pattern: %s; channel-member-api: %s; channel-roster-api: %s; channel-cache: %d; chat-presence: %d; whodat-channel: %s; peer-send: %s; hello: %s; probe: %s; peers-alliance: %d/%d; peers-horde: %d/%d; peers-total: %d; savedlog: %d.",
                 self.debugEnabled and "on" or "off",
                 ChatFrameAddMessageEventFilter and "available" or "missing",
                 FRIEND_ADDED_PATTERN and "ok" or "missing",
@@ -3149,7 +3199,8 @@ function WhoDat:HandleSlashCommand(message)
                 self.peerFactionMaxPerFaction or 32,
                 hordePeerCount,
                 self.peerFactionMaxPerFaction or 32,
-                peerTotalCount
+                peerTotalCount,
+                persistentLogCount
             ))
         end
         return
@@ -3161,6 +3212,21 @@ end
 function WhoDat:HandlePlayerLogin()
     WhoDatDB = WhoDatDB or {}
     WhoDatDB.channelCache = WhoDatDB.channelCache or {}
+    WhoDatDB.persistentDebugEvents = WhoDatDB.persistentDebugEvents or {}
+
+    local preLoginPersistentEvents = self.persistentDebugEvents
+    self.persistentDebugEvents = WhoDatDB.persistentDebugEvents
+    if type(preLoginPersistentEvents) == "table" and preLoginPersistentEvents ~= self.persistentDebugEvents then
+        for _, entry in ipairs(preLoginPersistentEvents) do
+            table.insert(self.persistentDebugEvents, entry)
+        end
+    end
+
+    local persistentMax = self.persistentDebugLogMaxEvents or 500
+    while #self.persistentDebugEvents > persistentMax do
+        table.remove(self.persistentDebugEvents, 1)
+    end
+
     self.channelCache = WhoDatDB.channelCache
     self.peerChannelMembers = {}
     self.peerFactionCache = {}
